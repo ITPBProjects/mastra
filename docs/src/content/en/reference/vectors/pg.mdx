@@ -1,6 +1,11 @@
 ---
 title: "Reference: PG Vector Store | Vectors"
 description: Documentation for the PgVector class in Mastra, which provides vector search using PostgreSQL with pgvector extension.
+packages:
+  - "@mastra/core"
+  - "@mastra/fastembed"
+  - "@mastra/memory"
+  - "@mastra/pg"
 ---
 
 # PG Vector Store
@@ -649,8 +654,8 @@ Embeddings are numeric vectors used by memory's `semanticRecall` to retrieve rel
 
 Install `fastembed` to get started:
 
-```bash
-npm install @mastra/fastembed@beta
+```bash npm2yarn
+npm install @mastra/fastembed@latest
 ```
 
 Add the following to your agent:

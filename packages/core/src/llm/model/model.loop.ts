@@ -138,7 +138,7 @@ export class MastraLLMVNext extends MastraBase {
     ];
   }
 
-  stream<Tools extends ToolSet, OUTPUT extends OutputSchema | undefined = undefined>({
+  stream<Tools extends ToolSet, OUTPUT = undefined>({
     resumeContext,
     runId,
     stopWhen = stepCountIs(5),
@@ -167,6 +167,8 @@ export class MastraLLMVNext extends MastraBase {
     includeRawChunks,
     autoResumeSuspendedTools,
     maxProcessorRetries,
+    processorStates,
+    activeTools,
   }: ModelLoopStreamArgs<Tools, OUTPUT>): MastraModelOutput<OUTPUT> {
     let stopWhenToUse;
 
@@ -194,8 +196,6 @@ export class MastraLLMVNext extends MastraBase {
         messages: [...messageList.getSystemMessages(), ...messages],
       },
       attributes: {
-        agentId,
-        agentName,
         model: firstModel.modelId,
         provider: firstModel.provider,
         streaming: true,
@@ -240,6 +240,8 @@ export class MastraLLMVNext extends MastraBase {
         includeRawChunks,
         autoResumeSuspendedTools,
         maxProcessorRetries,
+        processorStates,
+        activeTools,
         options: {
           ...options,
           onStepFinish: async props => {

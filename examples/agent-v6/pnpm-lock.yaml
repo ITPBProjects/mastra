@@ -14,6 +14,7 @@ overrides:
   '@mastra/libsql': link:../../stores/libsql
   '@mastra/observability': link:../../observability/mastra
   '@mastra/evals': link:../../packages/evals
+  '@mastra/ai-sdk': link:../../client-sdks/ai-sdk
   mastra: link:../../packages/cli
 
 importers:
@@ -26,6 +27,9 @@ importers:
       '@ai-sdk/provider':
         specifier: ^3.0.0
         version: 3.0.0
+      '@mastra/ai-sdk':
+        specifier: link:../../client-sdks/ai-sdk
+        version: link:../../client-sdks/ai-sdk
       '@mastra/client-js':
         specifier: link:../../client-sdks/client-js
         version: link:../../client-sdks/client-js
@@ -57,7 +61,7 @@ importers:
         specifier: ^6.0.1
         version: 6.0.1(zod@3.25.76)
       typescript:
-        specifier: ^5.8.3
+        specifier: ^5.9.3
         version: 5.9.3
       zod:
         specifier: ^3

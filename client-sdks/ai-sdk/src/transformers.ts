@@ -1,8 +1,8 @@
+import { TransformStream } from 'node:stream/web';
 import type { LLMStepResult } from '@mastra/core/agent';
-import type { ChunkType, DataChunkType, NetworkChunkType } from '@mastra/core/stream';
+import type { AgentChunkType, ChunkType, DataChunkType, NetworkChunkType } from '@mastra/core/stream';
 import type { WorkflowRunStatus, WorkflowStepStatus, WorkflowStreamEvent } from '@mastra/core/workflows';
 import type { InferUIMessageChunk, TextStreamPart, ToolSet, UIMessage, UIMessageStreamOptions } from 'ai';
-import type { ZodType } from 'zod';
 import { convertMastraChunkToAISDKv5, convertFullStreamChunkToUIMessageStream } from './helpers';
 import type { ToolAgentChunkType, ToolWorkflowChunkType, ToolNetworkChunkType } from './helpers';
 import {
@@ -87,7 +87,9 @@ const PRIMITIVE_CACHE_SYMBOL = Symbol('primitive-cache');
 
 export function WorkflowStreamToAISDKTransformer({
   includeTextStreamParts,
-}: { includeTextStreamParts?: boolean } = {}) {
+  sendReasoning,
+  sendSources,
+}: { includeTextStreamParts?: boolean; sendReasoning?: boolean; sendSources?: boolean } = {}) {
   const bufferedWorkflows = new Map<
     string,
     {
@@ -96,7 +98,7 @@ export function WorkflowStreamToAISDKTransformer({
     }
   >();
   return new TransformStream<
-    ChunkType,
+    ChunkType<any>,
     | {
         data?: string;
         type?: 'start' | 'finish';
@@ -119,7 +121,10 @@ export function WorkflowStreamToAISDKTransformer({
       });
     },
     transform(chunk, controller) {
-      const transformed = transformWorkflow<any>(chunk, bufferedWorkflows, false, includeTextStreamParts);
+      const transformed = transformWorkflow<any>(chunk, bufferedWorkflows, false, includeTextStreamParts, {
+        sendReasoning,
+        sendSources,
+      });
       if (transformed) controller.enqueue(transformed);
     },
   });
@@ -139,6 +144,7 @@ export function AgentNetworkToAISDKTransformer() {
       })[];
       usage: LanguageModelV2Usage | null;
       output: unknown | null;
+      hasEmittedText: boolean;
     }
   >();
 
@@ -164,15 +170,23 @@ export function AgentNetworkToAISDKTransformer() {
     },
     transform(chunk, controller) {
       const transformed = transformNetwork(chunk, bufferedNetworks);
-      if (transformed) controller.enqueue(transformed);
+      if (transformed) {
+        if (Array.isArray(transformed)) {
+          for (const item of transformed) {
+            controller.enqueue(item);
+          }
+        } else {
+          controller.enqueue(transformed);
+        }
+      }
     },
   });
 }
 
-export function AgentStreamToAISDKTransformer<TOutput extends ZodType<any>>({
+export function AgentStreamToAISDKTransformer<OUTPUT>({
   lastMessageId,
-  sendStart,
-  sendFinish,
+  sendStart = true,
+  sendFinish = true,
   sendReasoning,
   sendSources,
   messageMetadata,
@@ -190,7 +204,7 @@ export function AgentStreamToAISDKTransformer<TOutput extends ZodType<any>>({
   let tripwireOccurred = false;
   let finishEventSent = false;
 
-  return new TransformStream<ChunkType<TOutput>, object>({
+  return new TransformStream<ChunkType<OUTPUT>, object>({
     transform(chunk, controller) {
       // Track if tripwire occurred
       if (chunk.type === 'tripwire') {
@@ -220,7 +234,7 @@ export function AgentStreamToAISDKTransformer<TOutput extends ZodType<any>>({
       if (transformedChunk) {
         if (transformedChunk.type === 'tool-agent') {
           const payload = transformedChunk.payload;
-          const agentTransformed = transformAgent<TOutput>(payload, bufferedSteps);
+          const agentTransformed = transformAgent<OUTPUT>(payload, bufferedSteps);
           if (agentTransformed) controller.enqueue(agentTransformed);
         } else if (transformedChunk.type === 'tool-workflow') {
           const payload = transformedChunk.payload;
@@ -249,10 +263,7 @@ export function AgentStreamToAISDKTransformer<TOutput extends ZodType<any>>({
   });
 }
 
-export function transformAgent<TOutput extends ZodType<any>>(
-  payload: ChunkType<TOutput>,
-  bufferedSteps: Map<string, any>,
-) {
+export function transformAgent<OUTPUT>(payload: ChunkType<OUTPUT>, bufferedSteps: Map<string, any>) {
   let hasChanged = false;
   switch (payload.type) {
     case 'start':
@@ -401,8 +412,8 @@ export function transformAgent<TOutput extends ZodType<any>>(
   return null;
 }
 
-export function transformWorkflow<TOutput extends ZodType<any>>(
-  payload: ChunkType<TOutput>,
+export function transformWorkflow<OUTPUT>(
+  payload: ChunkType<OUTPUT>,
   bufferedWorkflows: Map<
     string,
     {
@@ -412,6 +423,7 @@ export function transformWorkflow<TOutput extends ZodType<any>>(
   >,
   isNested?: boolean,
   includeTextStreamParts?: boolean,
+  streamOptions?: { sendReasoning?: boolean; sendSources?: boolean },
 ) {
   switch (payload.type) {
     case 'workflow-start':
@@ -509,10 +521,13 @@ export function transformWorkflow<TOutput extends ZodType<any>>(
       const output = payload.payload.output;
 
       if (includeTextStreamParts && output && isMastraTextStreamChunk(output)) {
-        const part = convertMastraChunkToAISDKv5({ chunk: output, mode: 'stream' });
+        // @ts-expect-error - generic type mismatch in conversion
+        const part = convertMastraChunkToAISDKv5<OUTPUT>({ chunk: output, mode: 'stream' });
 
-        const transformedChunk = convertFullStreamChunkToUIMessageStream<any>({
+        const transformedChunk = convertFullStreamChunkToUIMessageStream({
           part: part as any,
+          sendReasoning: streamOptions?.sendReasoning,
+          sendSources: streamOptions?.sendSources,
           onError(error) {
             return safeParseErrorObject(error);
           },
@@ -527,7 +542,8 @@ export function transformWorkflow<TOutput extends ZodType<any>>(
             `UI Messages require a data property when using data- prefixed chunks \n ${JSON.stringify(output)}`,
           );
         }
-        return output;
+        const { type, data, id } = output;
+        return { type, data, ...(id !== undefined && { id }) };
       }
       return null;
     }
@@ -539,12 +555,20 @@ export function transformWorkflow<TOutput extends ZodType<any>>(
             `UI Messages require a data property when using data- prefixed chunks \n ${JSON.stringify(payload)}`,
           );
         }
-        return payload;
+        const { type, data, id } = payload;
+
+        return {
+          type,
+          data,
+          ...(id !== undefined && { id }),
+        };
       }
       return null;
     }
   }
 }
+
+type TransformNetworkResult = InferUIMessageChunk<UIMessage> | NetworkDataPart | DataChunkType;
 
 export function transformNetwork(
   payload: NetworkChunkType,
@@ -561,10 +585,11 @@ export function transformNetwork(
       })[];
       usage: LanguageModelV2Usage | null;
       output: unknown | null;
+      hasEmittedText?: boolean;
     }
   >,
   isNested?: boolean,
-): InferUIMessageChunk<UIMessage> | NetworkDataPart | DataChunkType | null {
+): TransformNetworkResult | TransformNetworkResult[] | null {
   switch (payload.type) {
     case 'routing-agent-start': {
       if (!bufferedNetworks.has(payload.runId)) {
@@ -573,6 +598,7 @@ export function transformNetwork(
           steps: [],
           usage: null,
           output: null,
+          hasEmittedText: false,
         });
       }
 
@@ -609,6 +635,7 @@ export function transformNetwork(
     case 'routing-agent-text-start': {
       const current = bufferedNetworks.get(payload.runId!);
       if (!current) return null;
+      current.hasEmittedText = true;
       return {
         type: 'text-start',
         id: payload.runId!,
@@ -617,6 +644,7 @@ export function transformNetwork(
     case 'routing-agent-text-delta': {
       const current = bufferedNetworks.get(payload.runId!);
       if (!current) return null;
+      current.hasEmittedText = true;
       return {
         type: 'text-delta',
         id: payload.runId!,
@@ -812,15 +840,29 @@ export function transformNetwork(
     case 'network-execution-event-step-finish': {
       const current = bufferedNetworks.get(payload.runId);
       if (!current) return null;
-      return {
+
+      const resultText = payload.payload?.result;
+      const dataNetworkChunk = {
         type: isNested ? 'data-tool-network' : 'data-network',
         id: payload.runId,
         data: {
           ...current,
           status: 'finished',
-          output: payload.payload?.result ?? current.output,
+          output: resultText ?? current.output,
         },
       } as const;
+
+      // Fallback: emit text events from result if core didn't send routing-agent-text-* events
+      if (!current.hasEmittedText && resultText && typeof resultText === 'string' && resultText.length > 0) {
+        current.hasEmittedText = true;
+        return [
+          { type: 'text-start', id: payload.runId } as const,
+          { type: 'text-delta', id: payload.runId, delta: resultText } as const,
+          dataNetworkChunk,
+        ];
+      }
+
+      return dataNetworkChunk;
     }
     case 'network-execution-event-finish': {
       const current = bufferedNetworks.get(payload.runId!);
@@ -836,6 +878,12 @@ export function transformNetwork(
         },
       } as const;
     }
+    case 'network-object':
+    case 'network-object-result': {
+      // Structured output chunks - currently not exposed in AI SDK format
+      // These are used by MastraAgentNetworkStream's .object and .objectStream getters
+      return null;
+    }
     default: {
       // Check for custom data chunks first (before processing as events)
       if (isAgentExecutionDataChunkType(payload)) {
@@ -845,8 +893,8 @@ export function transformNetwork(
           );
         }
 
-        const { type, data } = payload.payload;
-        return { type, data };
+        const { type, data, id } = payload.payload;
+        return { type, data, ...(id !== undefined && { id }) };
       }
       if (isWorkflowExecutionDataChunkType(payload)) {
         if (!('data' in payload.payload)) {
@@ -854,12 +902,12 @@ export function transformNetwork(
             `UI Messages require a data property when using data- prefixed chunks \n ${JSON.stringify(payload)}`,
           );
         }
-        const { type, data } = payload.payload;
-        return { type, data };
+        const { type, data, id } = payload.payload;
+        return { type, data, ...(id !== undefined && { id }) };
       }
 
       if (payload.type.startsWith('agent-execution-event-')) {
-        const stepId = payload.payload.runId;
+        const stepId = (payload.payload as AgentChunkType).runId;
         const current = bufferedNetworks.get(payload.runId!);
         if (!current) return null;
 
@@ -887,7 +935,7 @@ export function transformNetwork(
       }
 
       if (payload.type.startsWith('workflow-execution-event-')) {
-        const stepId = payload.payload.runId;
+        const stepId = (payload.payload as WorkflowStreamEvent).runId;
         const current = bufferedNetworks.get(payload.runId!);
         if (!current) return null;
 
@@ -926,8 +974,8 @@ export function transformNetwork(
           );
         }
 
-        const { type, data } = payload;
-        return { type, data };
+        const { type, data, id } = payload;
+        return { type, data, ...(id !== undefined && { id }) };
       }
       return null;
     }

@@ -1,6 +1,12 @@
 ---
 title: "Reference: voice.listen() | Voice"
 description: "Documentation for the listen() method available in all Mastra voice providers, which converts speech to text."
+packages:
+  - "@mastra/core"
+  - "@mastra/node-audio"
+  - "@mastra/voice-openai"
+  - "@mastra/voice-openai-realtime"
+  - "@mastra/voice-playai"
 ---
 
 # voice.listen()
@@ -191,7 +197,7 @@ const transcriptWithOptions = await voice.listen(audioStream, {
 });
 ```
 
-See the [CompositeVoice reference](/reference/v1/voice/composite-voice) for more details on AI SDK integration.
+See the [CompositeVoice reference](/reference/voice/composite-voice) for more details on AI SDK integration.
 
 
 ## Realtime Voice Providers

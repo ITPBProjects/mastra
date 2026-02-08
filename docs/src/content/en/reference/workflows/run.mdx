@@ -1,6 +1,8 @@
 ---
 title: "Reference: Run Class | Workflows"
 description: Documentation for the Run class in Mastra, which represents a workflow execution instance.
+packages:
+  - "@mastra/core"
 ---
 
 # Run Class
@@ -53,8 +55,8 @@ if (result.status === "suspended") {
     },
     {
       name: "cancel",
-      type: "() => Promise<void>",
-      description: "Cancels the workflow execution",
+      type: "() => Promise<{ message: string }>",
+      description: "Cancels the workflow execution, stopping any running steps and preventing subsequent steps from executing",
       required: true,
     },
     {
@@ -102,6 +104,12 @@ A workflow run's `status` indicates its current execution state. The possible va
       description:
         "Workflow execution is paused waiting for resume, with suspended step information",
     },
+    {
+      name: "canceled",
+      type: "string",
+      description:
+        "Workflow execution was canceled via the cancel() method, stopping any running steps and preventing subsequent steps from executing",
+    },
   ]}
 />
 
@@ -112,5 +120,5 @@ A workflow run's `status` indicates its current execution state. The possible va
 - [Run.cancel()](./run-methods/cancel)
 - [Run.restart()](./run-methods/restart)
 - [Run.timeTravel()](./run-methods/timeTravel)
-- [Run.stream()](/docs/v1/streaming/workflow-streaming)
+- [Run.stream()](/docs/streaming/workflow-streaming)
 - [Run.timeTravelStream()](../streaming/workflows/timeTravelStream)

@@ -12,13 +12,28 @@ import {
   TABLE_SCHEMAS,
   createStorageErrorId,
 } from '@mastra/core/storage';
+
+/**
+ * Local constant for the observational memory table name.
+ * Defined locally to avoid a static import that crashes on older @mastra/core
+ * versions that don't export TABLE_OBSERVATIONAL_MEMORY.
+ */
+const OM_TABLE = 'mastra_observational_memory' as const;
 import type {
   StorageResourceType,
   StorageListMessagesInput,
+  StorageListMessagesByResourceIdInput,
   StorageListMessagesOutput,
-  StorageListThreadsByResourceIdInput,
-  StorageListThreadsByResourceIdOutput,
+  StorageListThreadsInput,
+  StorageListThreadsOutput,
   CreateIndexOptions,
+  StorageCloneThreadInput,
+  StorageCloneThreadOutput,
+  ThreadCloneMetadata,
+  ObservationalMemoryRecord,
+  CreateObservationalMemoryInput,
+  UpdateActiveObservationsInput,
+  CreateReflectionGenerationInput,
 } from '@mastra/core/storage';
 import { PgDB, resolvePgConfig } from '../../db';
 import type { PgDomainConfig } from '../../db';
@@ -44,14 +59,26 @@ function getTableName({ indexName, schemaName }: { indexName: string; schemaName
   return schemaName ? `${schemaName}.${quotedIndexName}` : quotedIndexName;
 }
 
+/**
+ * Generate SQL placeholder string for IN clauses.
+ * @param count - Number of placeholders to generate
+ * @param startIndex - Starting index for placeholders (default: 1)
+ * @returns Comma-separated placeholder string, e.g. "$1, $2, $3"
+ */
+function inPlaceholders(count: number, startIndex = 1): string {
+  return Array.from({ length: count }, (_, i) => `$${i + startIndex}`).join(', ');
+}
+
 export class MemoryPG extends MemoryStorage {
+  readonly supportsObservationalMemory = true;
+
   #db: PgDB;
   #schema: string;
   #skipDefaultIndexes?: boolean;
   #indexes?: CreateIndexOptions[];
 
   /** Tables managed by this domain */
-  static readonly MANAGED_TABLES = [TABLE_THREADS, TABLE_MESSAGES, TABLE_RESOURCES] as const;
+  static readonly MANAGED_TABLES = [TABLE_THREADS, TABLE_MESSAGES, TABLE_RESOURCES, OM_TABLE] as const;
 
   constructor(config: PgDomainConfig) {
     super();
@@ -67,11 +94,35 @@ export class MemoryPG extends MemoryStorage {
     await this.#db.createTable({ tableName: TABLE_THREADS, schema: TABLE_SCHEMAS[TABLE_THREADS] });
     await this.#db.createTable({ tableName: TABLE_MESSAGES, schema: TABLE_SCHEMAS[TABLE_MESSAGES] });
     await this.#db.createTable({ tableName: TABLE_RESOURCES, schema: TABLE_SCHEMAS[TABLE_RESOURCES] });
+
+    // Dynamically import OM schema to avoid breaking older @mastra/core versions
+    let omSchema: Record<string, any> | undefined;
+    try {
+      const { OBSERVATIONAL_MEMORY_TABLE_SCHEMA } = await import('@mastra/core/storage');
+      omSchema = OBSERVATIONAL_MEMORY_TABLE_SCHEMA?.[OM_TABLE];
+    } catch {
+      // OM not available in this version of core
+    }
+
+    if (omSchema) {
+      await this.#db.createTable({
+        tableName: OM_TABLE as any,
+        schema: omSchema,
+      });
+    }
     await this.#db.alterTable({
       tableName: TABLE_MESSAGES,
       schema: TABLE_SCHEMAS[TABLE_MESSAGES],
       ifNotExists: ['resourceId'],
     });
+    if (omSchema) {
+      // Create index on lookupKey for efficient OM queries
+      const omTableName = getTableName({
+        indexName: OM_TABLE,
+        schemaName: getSchemaName(this.#schema),
+      });
+      await this.#db.client.none(`CREATE INDEX IF NOT EXISTS idx_om_lookup_key ON ${omTableName} ("lookupKey")`);
+    }
     await this.createDefaultIndexes();
     await this.createCustomIndexes();
   }
@@ -188,31 +239,69 @@ export class MemoryPG extends MemoryStorage {
     }
   }
 
-  public async listThreadsByResourceId(
-    args: StorageListThreadsByResourceIdInput,
-  ): Promise<StorageListThreadsByResourceIdOutput> {
-    const { resourceId, page = 0, perPage: perPageInput, orderBy } = args;
+  public async listThreads(args: StorageListThreadsInput): Promise<StorageListThreadsOutput> {
+    const { page = 0, perPage: perPageInput, orderBy, filter } = args;
 
-    if (page < 0) {
+    try {
+      // Validate pagination input before normalization
+      // This ensures page === 0 when perPageInput === false
+      this.validatePaginationInput(page, perPageInput ?? 100);
+    } catch (error) {
       throw new MastraError({
-        id: createStorageErrorId('PG', 'LIST_THREADS_BY_RESOURCE_ID', 'INVALID_PAGE'),
+        id: createStorageErrorId('PG', 'LIST_THREADS', 'INVALID_PAGE'),
         domain: ErrorDomain.STORAGE,
         category: ErrorCategory.USER,
-        text: 'Page number must be non-negative',
-        details: {
-          resourceId,
-          page,
-        },
+        text: error instanceof Error ? error.message : 'Invalid pagination parameters',
+        details: { page, ...(perPageInput !== undefined && { perPage: perPageInput }) },
+      });
+    }
+
+    const perPage = normalizePerPage(perPageInput, 100);
+
+    // Validate metadata keys to prevent SQL injection
+    try {
+      this.validateMetadataKeys(filter?.metadata);
+    } catch (error) {
+      throw new MastraError({
+        id: createStorageErrorId('PG', 'LIST_THREADS', 'INVALID_METADATA_KEY'),
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.USER,
+        text: error instanceof Error ? error.message : 'Invalid metadata key',
+        details: { metadataKeys: filter?.metadata ? Object.keys(filter.metadata).join(', ') : '' },
       });
     }
 
     const { field, direction } = this.parseOrderBy(orderBy);
-    const perPage = normalizePerPage(perPageInput, 100);
     const { offset, perPage: perPageForResponse } = calculatePagination(page, perPageInput, perPage);
+
     try {
       const tableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
-      const baseQuery = `FROM ${tableName} WHERE "resourceId" = $1`;
-      const queryParams: any[] = [resourceId];
+      const whereClauses: string[] = [];
+      const queryParams: any[] = [];
+      let paramIndex = 1;
+
+      // Add resourceId filter if provided
+      if (filter?.resourceId) {
+        whereClauses.push(`"resourceId" = $${paramIndex}`);
+        queryParams.push(filter.resourceId);
+        paramIndex++;
+      }
+
+      // Add metadata filters if provided (AND logic)
+      // Uses JSONB containment (@>) to avoid SQL injection and correctly match all value types including null
+      // metadata column is TEXT type storing JSON, so we need to cast to jsonb first
+      if (filter?.metadata && Object.keys(filter.metadata).length > 0) {
+        for (const [key, value] of Object.entries(filter.metadata)) {
+          // Use JSONB containment operator - no key interpolation needed
+          whereClauses.push(`metadata::jsonb @> $${paramIndex}::jsonb`);
+          // Build a small JSON object for each key-value pair
+          queryParams.push(JSON.stringify({ [key]: value }));
+          paramIndex++;
+        }
+      }
+
+      const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+      const baseQuery = `FROM ${tableName} ${whereClause}`;
 
       const countQuery = `SELECT COUNT(*) ${baseQuery}`;
       const countResult = await this.#db.client.one(countQuery, queryParams);
@@ -229,14 +318,21 @@ export class MemoryPG extends MemoryStorage {
       }
 
       const limitValue = perPageInput === false ? total : perPage;
-      const dataQuery = `SELECT id, "resourceId", title, metadata, "createdAt", "updatedAt" ${baseQuery} ORDER BY "${field}" ${direction} LIMIT $2 OFFSET $3`;
-      const rows = await this.#db.client.manyOrNone(dataQuery, [...queryParams, limitValue, offset]);
+      // Select both standard and timezone-aware columns (*Z) for proper UTC timestamp handling
+      const dataQuery = `SELECT id, "resourceId", title, metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ" ${baseQuery} ORDER BY "${field}" ${direction} LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+      const rows = await this.#db.client.manyOrNone<StorageThreadType & { createdAtZ: Date; updatedAtZ: Date }>(
+        dataQuery,
+        [...queryParams, limitValue, offset],
+      );
 
       const threads = (rows || []).map(thread => ({
-        ...thread,
+        id: thread.id,
+        resourceId: thread.resourceId,
+        title: thread.title,
         metadata: typeof thread.metadata === 'string' ? JSON.parse(thread.metadata) : thread.metadata,
-        createdAt: thread.createdAt,
-        updatedAt: thread.updatedAt,
+        // Use timezone-aware columns (*Z) for correct UTC timestamps, with fallback for legacy data
+        createdAt: thread.createdAtZ || thread.createdAt,
+        updatedAt: thread.updatedAtZ || thread.updatedAt,
       }));
 
       return {
@@ -249,11 +345,12 @@ export class MemoryPG extends MemoryStorage {
     } catch (error) {
       const mastraError = new MastraError(
         {
-          id: createStorageErrorId('PG', 'LIST_THREADS_BY_RESOURCE_ID', 'FAILED'),
+          id: createStorageErrorId('PG', 'LIST_THREADS', 'FAILED'),
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
           details: {
-            resourceId,
+            ...(filter?.resourceId && { resourceId: filter.resourceId }),
+            hasMetadataFilter: !!filter?.metadata,
             page,
           },
         },
@@ -351,17 +448,18 @@ export class MemoryPG extends MemoryStorage {
     };
 
     try {
+      const now = new Date().toISOString();
       const thread = await this.#db.client.one<StorageThreadType & { createdAtZ: Date; updatedAtZ: Date }>(
         `UPDATE ${threadTableName}
                     SET
                         title = $1,
                         metadata = $2,
                         "updatedAt" = $3,
-                        "updatedAtZ" = $3
-                    WHERE id = $4
+                        "updatedAtZ" = $4
+                    WHERE id = $5
                     RETURNING *
                 `,
-        [title, mergedMetadata, new Date().toISOString(), id],
+        [title, mergedMetadata, now, now, id],
       );
 
       return {
@@ -463,8 +561,8 @@ export class MemoryPG extends MemoryStorage {
         SELECT ${selectColumns}
         FROM ${tableName} m
         WHERE m.thread_id = (SELECT thread_id FROM ${tableName} WHERE id = $${paramIdx})
-          AND m."createdAt" <= (SELECT "createdAt" FROM ${tableName} WHERE id = $${paramIdx})
-        ORDER BY m."createdAt" DESC
+          AND COALESCE(m."createdAtZ", m."createdAt") <= (SELECT COALESCE("createdAtZ", "createdAt") FROM ${tableName} WHERE id = $${paramIdx})
+        ORDER BY COALESCE(m."createdAtZ", m."createdAt") DESC
         LIMIT $${paramIdx + 1}
       )`);
       params.push(id, withPreviousMessages + 1); // +1 to include the target message itself
@@ -477,8 +575,8 @@ export class MemoryPG extends MemoryStorage {
           SELECT ${selectColumns}
           FROM ${tableName} m
           WHERE m.thread_id = (SELECT thread_id FROM ${tableName} WHERE id = $${paramIdx})
-            AND m."createdAt" > (SELECT "createdAt" FROM ${tableName} WHERE id = $${paramIdx})
-          ORDER BY m."createdAt" ASC
+            AND COALESCE(m."createdAtZ", m."createdAt") > (SELECT COALESCE("createdAtZ", "createdAt") FROM ${tableName} WHERE id = $${paramIdx})
+          ORDER BY COALESCE(m."createdAtZ", m."createdAt") ASC
           LIMIT $${paramIdx + 1}
         )`);
         params.push(id, withNextMessages);
@@ -538,7 +636,7 @@ export class MemoryPG extends MemoryStorage {
       const tableName = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
       const query = `
         ${selectStatement} FROM ${tableName}
-        WHERE id IN (${messageIds.map((_, i) => `$${i + 1}`).join(', ')})
+        WHERE id IN (${inPlaceholders(messageIds.length)})
         ORDER BY "createdAt" DESC
       `;
       const resultRows = await this.#db.client.manyOrNone(query, messageIds);
@@ -608,8 +706,7 @@ export class MemoryPG extends MemoryStorage {
       const selectStatement = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"`;
       const tableName = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
 
-      const threadPlaceholders = threadIds.map((_, i) => `$${i + 1}`).join(', ');
-      const conditions: string[] = [`thread_id IN (${threadPlaceholders})`];
+      const conditions: string[] = [`thread_id IN (${inPlaceholders(threadIds.length)})`];
       const queryParams: any[] = [...threadIds];
       let paramIndex = threadIds.length + 1;
 
@@ -619,12 +716,14 @@ export class MemoryPG extends MemoryStorage {
       }
 
       if (filter?.dateRange?.start) {
-        conditions.push(`"createdAt" >= $${paramIndex++}`);
+        const startOp = filter.dateRange.startExclusive ? '>' : '>=';
+        conditions.push(`COALESCE("createdAtZ", "createdAt") ${startOp} $${paramIndex++}`);
         queryParams.push(filter.dateRange.start);
       }
 
       if (filter?.dateRange?.end) {
-        conditions.push(`"createdAt" <= $${paramIndex++}`);
+        const endOp = filter.dateRange.endExclusive ? '<' : '<=';
+        conditions.push(`COALESCE("createdAtZ", "createdAt") ${endOp} $${paramIndex++}`);
         queryParams.push(filter.dateRange.end);
       }
 
@@ -726,6 +825,164 @@ export class MemoryPG extends MemoryStorage {
     }
   }
 
+  public async listMessagesByResourceId(
+    args: StorageListMessagesByResourceIdInput,
+  ): Promise<StorageListMessagesOutput> {
+    const { resourceId, include, filter, perPage: perPageInput, page = 0, orderBy } = args;
+
+    // Validate that resourceId is provided
+    const hasResourceId = resourceId !== undefined && resourceId !== null && resourceId.trim() !== '';
+    if (!hasResourceId) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'LIST_MESSAGES_BY_RESOURCE_ID', 'INVALID_QUERY'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.USER,
+          details: {
+            resourceId: resourceId ?? '',
+          },
+        },
+        new Error('resourceId is required'),
+      );
+    }
+
+    // Validate page parameter
+    if (page < 0) {
+      throw new MastraError({
+        id: createStorageErrorId('PG', 'LIST_MESSAGES_BY_RESOURCE_ID', 'INVALID_PAGE'),
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.USER,
+        text: 'Page number must be non-negative',
+        details: {
+          resourceId,
+          page,
+        },
+      });
+    }
+
+    const perPage = normalizePerPage(perPageInput, 40);
+    const { offset, perPage: perPageForResponse } = calculatePagination(page, perPageInput, perPage);
+
+    try {
+      const { field, direction } = this.parseOrderBy(orderBy, 'ASC');
+      const orderByStatement = `ORDER BY "${field}" ${direction}`;
+
+      const selectStatement = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"`;
+      const tableName = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
+
+      // Build WHERE conditions
+      const conditions: string[] = [];
+      const queryParams: any[] = [];
+      let paramIndex = 1;
+
+      // Add resourceId filter
+      conditions.push(`"resourceId" = $${paramIndex++}`);
+      queryParams.push(resourceId);
+
+      if (filter?.dateRange?.start) {
+        const startOp = filter.dateRange.startExclusive ? '>' : '>=';
+        conditions.push(`"createdAt" ${startOp} $${paramIndex++}`);
+        queryParams.push(filter.dateRange.start);
+      }
+
+      if (filter?.dateRange?.end) {
+        const endOp = filter.dateRange.endExclusive ? '<' : '<=';
+        conditions.push(`"createdAt" ${endOp} $${paramIndex++}`);
+        queryParams.push(filter.dateRange.end);
+      }
+
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+      const countQuery = `SELECT COUNT(*) FROM ${tableName} ${whereClause}`;
+      const countResult = await this.#db.client.one(countQuery, queryParams);
+      const total = parseInt(countResult.count, 10);
+
+      const limitValue = perPageInput === false ? total : perPage;
+      const dataQuery = `${selectStatement} FROM ${tableName} ${whereClause} ${orderByStatement} LIMIT $${paramIndex++} OFFSET $${paramIndex++}`;
+      const rows = await this.#db.client.manyOrNone(dataQuery, [...queryParams, limitValue, offset]);
+      const messages: MessageRowFromDB[] = [...(rows || [])];
+
+      if (total === 0 && messages.length === 0 && (!include || include.length === 0)) {
+        return {
+          messages: [],
+          total: 0,
+          page,
+          perPage: perPageForResponse,
+          hasMore: false,
+        };
+      }
+
+      const messageIds = new Set(messages.map(m => m.id));
+      if (include && include.length > 0) {
+        const includeMessages = await this._getIncludedMessages({ include });
+        if (includeMessages) {
+          for (const includeMsg of includeMessages) {
+            if (!messageIds.has(includeMsg.id)) {
+              messages.push(includeMsg);
+              messageIds.add(includeMsg.id);
+            }
+          }
+        }
+      }
+
+      const messagesWithParsedContent = messages.map(row => this.parseRow(row));
+
+      const list = new MessageList().add(messagesWithParsedContent, 'memory');
+      let finalMessages = list.get.all.db();
+
+      finalMessages = finalMessages.sort((a, b) => {
+        const aValue = field === 'createdAt' ? new Date(a.createdAt).getTime() : (a as any)[field];
+        const bValue = field === 'createdAt' ? new Date(b.createdAt).getTime() : (b as any)[field];
+
+        if (aValue == null && bValue == null) return a.id.localeCompare(b.id);
+        if (aValue == null) return 1;
+        if (bValue == null) return -1;
+
+        if (aValue === bValue) {
+          return a.id.localeCompare(b.id);
+        }
+
+        if (typeof aValue === 'number' && typeof bValue === 'number') {
+          return direction === 'ASC' ? aValue - bValue : bValue - aValue;
+        }
+        return direction === 'ASC'
+          ? String(aValue).localeCompare(String(bValue))
+          : String(bValue).localeCompare(String(aValue));
+      });
+
+      const hasMore = perPageInput !== false && offset + perPage < total;
+
+      return {
+        messages: finalMessages,
+        total,
+        page,
+        perPage: perPageForResponse,
+        hasMore,
+      };
+    } catch (error) {
+      const mastraError = new MastraError(
+        {
+          id: createStorageErrorId('PG', 'LIST_MESSAGES_BY_RESOURCE_ID', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: {
+            resourceId: resourceId ?? '',
+          },
+        },
+        error,
+      );
+      this.logger?.error?.(mastraError.toString());
+      this.logger?.trackException(mastraError);
+      return {
+        messages: [],
+        total: 0,
+        page,
+        perPage: perPageForResponse,
+        hasMore: false,
+      };
+    }
+  }
+
   async saveMessages({ messages }: { messages: MastraDBMessage[] }): Promise<{ messages: MastraDBMessage[] }> {
     if (messages.length === 0) return { messages: [] };
 
@@ -789,14 +1046,15 @@ export class MemoryPG extends MemoryStorage {
         });
 
         const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+        const nowStr = new Date().toISOString();
         const threadUpdate = t.none(
           `UPDATE ${threadTableName}
                         SET
                             "updatedAt" = $1,
-                            "updatedAtZ" = $1
-                        WHERE id = $2
+                            "updatedAtZ" = $2
+                        WHERE id = $3
                     `,
-          [new Date().toISOString(), threadId],
+          [nowStr, nowStr, threadId],
         );
 
         await Promise.all([...messageInserts, threadUpdate]);
@@ -847,9 +1105,9 @@ export class MemoryPG extends MemoryStorage {
 
     const messageIds = messages.map(m => m.id);
 
-    const selectQuery = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId" FROM ${getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) })} WHERE id IN ($1:list)`;
+    const selectQuery = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId" FROM ${getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) })} WHERE id IN (${inPlaceholders(messageIds.length)})`;
 
-    const existingMessagesDb = await this.#db.client.manyOrNone(selectQuery, [messageIds]);
+    const existingMessagesDb = await this.#db.client.manyOrNone(selectQuery, messageIds);
 
     if (existingMessagesDb.length === 0) {
       return [];
@@ -926,10 +1184,11 @@ export class MemoryPG extends MemoryStorage {
       }
 
       if (threadIdsToUpdate.size > 0) {
+        const threadIds = Array.from(threadIdsToUpdate);
         queries.push(
           t.none(
-            `UPDATE ${getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) })} SET "updatedAt" = NOW(), "updatedAtZ" = NOW() WHERE id IN ($1:list)`,
-            [Array.from(threadIdsToUpdate)],
+            `UPDATE ${getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) })} SET "updatedAt" = NOW(), "updatedAtZ" = NOW() WHERE id IN (${inPlaceholders(threadIds.length)})`,
+            threadIds,
           ),
         );
       }
@@ -939,7 +1198,7 @@ export class MemoryPG extends MemoryStorage {
       }
     });
 
-    const updatedMessages = await this.#db.client.manyOrNone<MessageRowFromDB>(selectQuery, [messageIds]);
+    const updatedMessages = await this.#db.client.manyOrNone<MessageRowFromDB>(selectQuery, messageIds);
 
     return (updatedMessages || []).map((row: MessageRowFromDB) => {
       const message = this.normalizeMessageRow(row);
@@ -1076,17 +1335,650 @@ export class MemoryPG extends MemoryStorage {
       paramIndex++;
     }
 
-    updates.push(`"updatedAt" = $${paramIndex}`);
-    values.push(updatedResource.updatedAt.toISOString());
+    const updatedAtStr = updatedResource.updatedAt.toISOString();
+    updates.push(`"updatedAt" = $${paramIndex++}`);
+    values.push(updatedAtStr);
     updates.push(`"updatedAtZ" = $${paramIndex++}`);
-    values.push(updatedResource.updatedAt.toISOString());
-
-    paramIndex++;
+    values.push(updatedAtStr);
 
     values.push(resourceId);
 
     await this.#db.client.none(`UPDATE ${tableName} SET ${updates.join(', ')} WHERE id = $${paramIndex}`, values);
 
     return updatedResource;
+  }
+
+  async cloneThread(args: StorageCloneThreadInput): Promise<StorageCloneThreadOutput> {
+    const { sourceThreadId, newThreadId: providedThreadId, resourceId, title, metadata, options } = args;
+
+    // Get the source thread
+    const sourceThread = await this.getThreadById({ threadId: sourceThreadId });
+    if (!sourceThread) {
+      throw new MastraError({
+        id: createStorageErrorId('PG', 'CLONE_THREAD', 'SOURCE_NOT_FOUND'),
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.USER,
+        text: `Source thread with id ${sourceThreadId} not found`,
+        details: { sourceThreadId },
+      });
+    }
+
+    // Use provided ID or generate a new one
+    const newThreadId = providedThreadId || crypto.randomUUID();
+
+    // Check if the new thread ID already exists
+    const existingThread = await this.getThreadById({ threadId: newThreadId });
+    if (existingThread) {
+      throw new MastraError({
+        id: createStorageErrorId('PG', 'CLONE_THREAD', 'THREAD_EXISTS'),
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.USER,
+        text: `Thread with id ${newThreadId} already exists`,
+        details: { newThreadId },
+      });
+    }
+
+    const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+    const messageTableName = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
+
+    try {
+      return await this.#db.client.tx(async t => {
+        // Build message query with filters
+        let messageQuery = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"
+                            FROM ${messageTableName} WHERE thread_id = $1`;
+        const messageParams: any[] = [sourceThreadId];
+        let paramIndex = 2;
+
+        // Apply date filters
+        if (options?.messageFilter?.startDate) {
+          messageQuery += ` AND COALESCE("createdAtZ", "createdAt") >= $${paramIndex++}`;
+          messageParams.push(options.messageFilter.startDate);
+        }
+        if (options?.messageFilter?.endDate) {
+          messageQuery += ` AND COALESCE("createdAtZ", "createdAt") <= $${paramIndex++}`;
+          messageParams.push(options.messageFilter.endDate);
+        }
+
+        // Apply message ID filter
+        if (options?.messageFilter?.messageIds && options.messageFilter.messageIds.length > 0) {
+          messageQuery += ` AND id IN (${options.messageFilter.messageIds.map(() => `$${paramIndex++}`).join(', ')})`;
+          messageParams.push(...options.messageFilter.messageIds);
+        }
+
+        messageQuery += ` ORDER BY "createdAt" ASC`;
+
+        // Apply message limit (from most recent, so we need to reverse order for limit then sort back)
+        if (options?.messageLimit && options.messageLimit > 0) {
+          // Get messages ordered DESC to get most recent, limited, then we'll reverse
+          const limitQuery = `SELECT * FROM (${messageQuery.replace('ORDER BY "createdAt" ASC', 'ORDER BY "createdAt" DESC')} LIMIT $${paramIndex}) AS limited ORDER BY "createdAt" ASC`;
+          messageParams.push(options.messageLimit);
+          messageQuery = limitQuery;
+        }
+
+        const sourceMessages = await t.manyOrNone<MessageRowFromDB>(messageQuery, messageParams);
+
+        const now = new Date();
+
+        // Determine the last message ID for clone metadata
+        const lastMessageId = sourceMessages.length > 0 ? sourceMessages[sourceMessages.length - 1]!.id : undefined;
+
+        // Create clone metadata
+        const cloneMetadata: ThreadCloneMetadata = {
+          sourceThreadId,
+          clonedAt: now,
+          ...(lastMessageId && { lastMessageId }),
+        };
+
+        // Create the new thread
+        const newThread: StorageThreadType = {
+          id: newThreadId,
+          resourceId: resourceId || sourceThread.resourceId,
+          title: title || (sourceThread.title ? `Clone of ${sourceThread.title}` : undefined),
+          metadata: {
+            ...metadata,
+            clone: cloneMetadata,
+          },
+          createdAt: now,
+          updatedAt: now,
+        };
+
+        // Insert the new thread
+        await t.none(
+          `INSERT INTO ${threadTableName} (
+            id,
+            "resourceId",
+            title,
+            metadata,
+            "createdAt",
+            "createdAtZ",
+            "updatedAt",
+            "updatedAtZ"
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [
+            newThread.id,
+            newThread.resourceId,
+            newThread.title,
+            newThread.metadata ? JSON.stringify(newThread.metadata) : null,
+            now,
+            now,
+            now,
+            now,
+          ],
+        );
+
+        // Clone messages with new IDs
+        const clonedMessages: MastraDBMessage[] = [];
+        const targetResourceId = resourceId || sourceThread.resourceId;
+
+        for (const sourceMsg of sourceMessages) {
+          const newMessageId = crypto.randomUUID();
+          const normalizedMsg = this.normalizeMessageRow(sourceMsg);
+          let parsedContent = normalizedMsg.content;
+          try {
+            parsedContent = JSON.parse(normalizedMsg.content);
+          } catch {
+            // use content as is
+          }
+
+          await t.none(
+            `INSERT INTO ${messageTableName} (id, thread_id, content, "createdAt", "createdAtZ", role, type, "resourceId")
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [
+              newMessageId,
+              newThreadId,
+              typeof normalizedMsg.content === 'string' ? normalizedMsg.content : JSON.stringify(normalizedMsg.content),
+              normalizedMsg.createdAt,
+              normalizedMsg.createdAt,
+              normalizedMsg.role,
+              normalizedMsg.type || 'v2',
+              targetResourceId,
+            ],
+          );
+
+          clonedMessages.push({
+            id: newMessageId,
+            threadId: newThreadId,
+            content: parsedContent,
+            role: normalizedMsg.role as MastraDBMessage['role'],
+            type: normalizedMsg.type,
+            createdAt: new Date(normalizedMsg.createdAt as string),
+            resourceId: targetResourceId,
+          });
+        }
+
+        return {
+          thread: newThread,
+          clonedMessages,
+        };
+      });
+    } catch (error) {
+      if (error instanceof MastraError) {
+        throw error;
+      }
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'CLONE_THREAD', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { sourceThreadId, newThreadId },
+        },
+        error,
+      );
+    }
+  }
+
+  // ============================================
+  // Observational Memory Methods
+  // ============================================
+
+  private getOMKey(threadId: string | null, resourceId: string): string {
+    return threadId ? `thread:${threadId}` : `resource:${resourceId}`;
+  }
+
+  private parseOMRow(row: any): ObservationalMemoryRecord {
+    // OM is a new table - use timezone-aware columns (*Z) directly (no legacy fallback needed)
+    return {
+      id: row.id,
+      scope: row.scope,
+      threadId: row.threadId || null,
+      resourceId: row.resourceId,
+      createdAt: new Date(row.createdAtZ),
+      updatedAt: new Date(row.updatedAtZ),
+      lastObservedAt: row.lastObservedAtZ ? new Date(row.lastObservedAtZ) : undefined,
+      originType: row.originType || 'initial',
+      generationCount: Number(row.generationCount || 0),
+      activeObservations: row.activeObservations || '',
+      bufferedObservations: row.activeObservationsPendingUpdate || undefined,
+      totalTokensObserved: Number(row.totalTokensObserved || 0),
+      observationTokenCount: Number(row.observationTokenCount || 0),
+      pendingMessageTokens: Number(row.pendingMessageTokens || 0),
+      isReflecting: Boolean(row.isReflecting),
+      isObserving: Boolean(row.isObserving),
+      config: row.config ? (typeof row.config === 'string' ? JSON.parse(row.config) : row.config) : {},
+      metadata: row.metadata ? (typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata) : undefined,
+      observedMessageIds: row.observedMessageIds
+        ? typeof row.observedMessageIds === 'string'
+          ? JSON.parse(row.observedMessageIds)
+          : row.observedMessageIds
+        : undefined,
+      observedTimezone: row.observedTimezone || undefined,
+    };
+  }
+
+  async getObservationalMemory(threadId: string | null, resourceId: string): Promise<ObservationalMemoryRecord | null> {
+    try {
+      const lookupKey = this.getOMKey(threadId, resourceId);
+      const tableName = getTableName({
+        indexName: OM_TABLE,
+        schemaName: getSchemaName(this.#schema),
+      });
+      const result = await this.#db.client.oneOrNone(
+        `SELECT * FROM ${tableName} WHERE "lookupKey" = $1 ORDER BY "generationCount" DESC LIMIT 1`,
+        [lookupKey],
+      );
+      if (!result) return null;
+      return this.parseOMRow(result);
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'GET_OBSERVATIONAL_MEMORY', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { threadId, resourceId },
+        },
+        error,
+      );
+    }
+  }
+
+  async getObservationalMemoryHistory(
+    threadId: string | null,
+    resourceId: string,
+    limit: number = 10,
+  ): Promise<ObservationalMemoryRecord[]> {
+    try {
+      const lookupKey = this.getOMKey(threadId, resourceId);
+      const tableName = getTableName({
+        indexName: OM_TABLE,
+        schemaName: getSchemaName(this.#schema),
+      });
+      const result = await this.#db.client.manyOrNone(
+        `SELECT * FROM ${tableName} WHERE "lookupKey" = $1 ORDER BY "generationCount" DESC LIMIT $2`,
+        [lookupKey, limit],
+      );
+      if (!result) return [];
+      return result.map(row => this.parseOMRow(row));
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'GET_OBSERVATIONAL_MEMORY_HISTORY', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { threadId, resourceId, limit },
+        },
+        error,
+      );
+    }
+  }
+
+  async initializeObservationalMemory(input: CreateObservationalMemoryInput): Promise<ObservationalMemoryRecord> {
+    try {
+      const id = crypto.randomUUID();
+      const now = new Date();
+      const lookupKey = this.getOMKey(input.threadId, input.resourceId);
+
+      const record: ObservationalMemoryRecord = {
+        id,
+        scope: input.scope,
+        threadId: input.threadId,
+        resourceId: input.resourceId,
+        createdAt: now,
+        updatedAt: now,
+        lastObservedAt: undefined,
+        originType: 'initial',
+        generationCount: 0,
+        activeObservations: '',
+        totalTokensObserved: 0,
+        observationTokenCount: 0,
+        pendingMessageTokens: 0,
+        isReflecting: false,
+        isObserving: false,
+        config: input.config,
+        observedTimezone: input.observedTimezone,
+      };
+
+      const tableName = getTableName({
+        indexName: OM_TABLE,
+        schemaName: getSchemaName(this.#schema),
+      });
+      const nowStr = now.toISOString();
+      await this.#db.client.none(
+        `INSERT INTO ${tableName} (
+          id, "lookupKey", scope, "resourceId", "threadId",
+          "activeObservations", "activeObservationsPendingUpdate",
+          "originType", config, "generationCount", "lastObservedAt", "lastObservedAtZ", "lastReflectionAt", "lastReflectionAtZ",
+          "pendingMessageTokens", "totalTokensObserved", "observationTokenCount",
+          "isObserving", "isReflecting", "observedTimezone", "createdAt", "createdAtZ", "updatedAt", "updatedAtZ"
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`,
+        [
+          id,
+          lookupKey,
+          input.scope,
+          input.resourceId,
+          input.threadId || null,
+          '',
+          null,
+          'initial',
+          JSON.stringify(input.config),
+          0,
+          null, // lastObservedAt
+          null, // lastObservedAtZ
+          null, // lastReflectionAt
+          null, // lastReflectionAtZ
+          0,
+          0,
+          0,
+          false,
+          false,
+          input.observedTimezone || null,
+          nowStr, // createdAt
+          nowStr, // createdAtZ
+          nowStr, // updatedAt
+          nowStr, // updatedAtZ
+        ],
+      );
+
+      return record;
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'INITIALIZE_OBSERVATIONAL_MEMORY', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { threadId: input.threadId, resourceId: input.resourceId },
+        },
+        error,
+      );
+    }
+  }
+
+  async updateActiveObservations(input: UpdateActiveObservationsInput): Promise<void> {
+    try {
+      const now = new Date();
+      const tableName = getTableName({
+        indexName: OM_TABLE,
+        schemaName: getSchemaName(this.#schema),
+      });
+
+      const lastObservedAtStr = input.lastObservedAt.toISOString();
+      const nowStr = now.toISOString();
+      const observedMessageIdsJson = input.observedMessageIds ? JSON.stringify(input.observedMessageIds) : null;
+      const result = await this.#db.client.query(
+        `UPDATE ${tableName} SET
+          "activeObservations" = $1,
+          "lastObservedAt" = $2,
+          "lastObservedAtZ" = $3,
+          "pendingMessageTokens" = 0,
+          "observationTokenCount" = $4,
+          "totalTokensObserved" = "totalTokensObserved" + $5,
+          "observedMessageIds" = $6,
+          "updatedAt" = $7,
+          "updatedAtZ" = $8
+        WHERE id = $9`,
+        [
+          input.observations,
+          lastObservedAtStr,
+          lastObservedAtStr,
+          input.tokenCount,
+          input.tokenCount,
+          observedMessageIdsJson,
+          nowStr,
+          nowStr,
+          input.id,
+        ],
+      );
+
+      if (result.rowCount === 0) {
+        throw new MastraError({
+          id: createStorageErrorId('PG', 'UPDATE_ACTIVE_OBSERVATIONS', 'NOT_FOUND'),
+          text: `Observational memory record not found: ${input.id}`,
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { id: input.id },
+        });
+      }
+    } catch (error) {
+      if (error instanceof MastraError) {
+        throw error;
+      }
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'UPDATE_ACTIVE_OBSERVATIONS', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { id: input.id },
+        },
+        error,
+      );
+    }
+  }
+
+  async createReflectionGeneration(input: CreateReflectionGenerationInput): Promise<ObservationalMemoryRecord> {
+    try {
+      const id = crypto.randomUUID();
+      const now = new Date();
+      const lookupKey = this.getOMKey(input.currentRecord.threadId, input.currentRecord.resourceId);
+
+      const record: ObservationalMemoryRecord = {
+        id,
+        scope: input.currentRecord.scope,
+        threadId: input.currentRecord.threadId,
+        resourceId: input.currentRecord.resourceId,
+        createdAt: now,
+        updatedAt: now,
+        lastObservedAt: input.currentRecord.lastObservedAt,
+        originType: 'reflection',
+        generationCount: input.currentRecord.generationCount + 1,
+        activeObservations: input.reflection,
+        totalTokensObserved: input.currentRecord.totalTokensObserved,
+        observationTokenCount: input.tokenCount,
+        pendingMessageTokens: 0,
+        isReflecting: false,
+        isObserving: false,
+        config: input.currentRecord.config,
+        metadata: input.currentRecord.metadata,
+        observedTimezone: input.currentRecord.observedTimezone,
+      };
+
+      const tableName = getTableName({
+        indexName: OM_TABLE,
+        schemaName: getSchemaName(this.#schema),
+      });
+      const nowStr = now.toISOString();
+      const lastObservedAtStr = record.lastObservedAt?.toISOString() || null;
+      await this.#db.client.none(
+        `INSERT INTO ${tableName} (
+          id, "lookupKey", scope, "resourceId", "threadId",
+          "activeObservations", "activeObservationsPendingUpdate",
+          "originType", config, "generationCount", "lastObservedAt", "lastObservedAtZ", "lastReflectionAt", "lastReflectionAtZ",
+          "pendingMessageTokens", "totalTokensObserved", "observationTokenCount",
+          "isObserving", "isReflecting", "observedTimezone", "createdAt", "createdAtZ", "updatedAt", "updatedAtZ"
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`,
+        [
+          id,
+          lookupKey,
+          record.scope,
+          record.resourceId,
+          record.threadId || null,
+          input.reflection,
+          null,
+          'reflection',
+          JSON.stringify(record.config),
+          input.currentRecord.generationCount + 1,
+          lastObservedAtStr, // lastObservedAt
+          lastObservedAtStr, // lastObservedAtZ
+          nowStr, // lastReflectionAt
+          nowStr, // lastReflectionAtZ
+          record.pendingMessageTokens,
+          record.totalTokensObserved,
+          record.observationTokenCount,
+          false,
+          false,
+          record.observedTimezone || null,
+          nowStr, // createdAt
+          nowStr, // createdAtZ
+          nowStr, // updatedAt
+          nowStr, // updatedAtZ
+        ],
+      );
+
+      return record;
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'CREATE_REFLECTION_GENERATION', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { currentRecordId: input.currentRecord.id },
+        },
+        error,
+      );
+    }
+  }
+
+  async setReflectingFlag(id: string, isReflecting: boolean): Promise<void> {
+    try {
+      const tableName = getTableName({
+        indexName: OM_TABLE,
+        schemaName: getSchemaName(this.#schema),
+      });
+      const nowStr = new Date().toISOString();
+      const result = await this.#db.client.query(
+        `UPDATE ${tableName} SET "isReflecting" = $1, "updatedAt" = $2, "updatedAtZ" = $3 WHERE id = $4`,
+        [isReflecting, nowStr, nowStr, id],
+      );
+
+      if (result.rowCount === 0) {
+        throw new MastraError({
+          id: createStorageErrorId('PG', 'SET_REFLECTING_FLAG', 'NOT_FOUND'),
+          text: `Observational memory record not found: ${id}`,
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { id, isReflecting },
+        });
+      }
+    } catch (error) {
+      if (error instanceof MastraError) {
+        throw error;
+      }
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'SET_REFLECTING_FLAG', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { id, isReflecting },
+        },
+        error,
+      );
+    }
+  }
+
+  async setObservingFlag(id: string, isObserving: boolean): Promise<void> {
+    try {
+      const tableName = getTableName({
+        indexName: OM_TABLE,
+        schemaName: getSchemaName(this.#schema),
+      });
+      const nowStr = new Date().toISOString();
+      const result = await this.#db.client.query(
+        `UPDATE ${tableName} SET "isObserving" = $1, "updatedAt" = $2, "updatedAtZ" = $3 WHERE id = $4`,
+        [isObserving, nowStr, nowStr, id],
+      );
+
+      if (result.rowCount === 0) {
+        throw new MastraError({
+          id: createStorageErrorId('PG', 'SET_OBSERVING_FLAG', 'NOT_FOUND'),
+          text: `Observational memory record not found: ${id}`,
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { id, isObserving },
+        });
+      }
+    } catch (error) {
+      if (error instanceof MastraError) {
+        throw error;
+      }
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'SET_OBSERVING_FLAG', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { id, isObserving },
+        },
+        error,
+      );
+    }
+  }
+
+  async clearObservationalMemory(threadId: string | null, resourceId: string): Promise<void> {
+    try {
+      const lookupKey = this.getOMKey(threadId, resourceId);
+      const tableName = getTableName({
+        indexName: OM_TABLE,
+        schemaName: getSchemaName(this.#schema),
+      });
+      await this.#db.client.none(`DELETE FROM ${tableName} WHERE "lookupKey" = $1`, [lookupKey]);
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'CLEAR_OBSERVATIONAL_MEMORY', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { threadId, resourceId },
+        },
+        error,
+      );
+    }
+  }
+
+  async addPendingMessageTokens(id: string, tokenCount: number): Promise<void> {
+    try {
+      const tableName = getTableName({
+        indexName: OM_TABLE,
+        schemaName: getSchemaName(this.#schema),
+      });
+      const nowStr = new Date().toISOString();
+      const result = await this.#db.client.query(
+        `UPDATE ${tableName} SET 
+          "pendingMessageTokens" = "pendingMessageTokens" + $1, 
+          "updatedAt" = $2,
+          "updatedAtZ" = $3
+        WHERE id = $4`,
+        [tokenCount, nowStr, nowStr, id],
+      );
+
+      if (result.rowCount === 0) {
+        throw new MastraError({
+          id: createStorageErrorId('PG', 'ADD_PENDING_MESSAGE_TOKENS', 'NOT_FOUND'),
+          text: `Observational memory record not found: ${id}`,
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { id, tokenCount },
+        });
+      }
+    } catch (error) {
+      if (error instanceof MastraError) {
+        throw error;
+      }
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'ADD_PENDING_MESSAGE_TOKENS', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { id, tokenCount },
+        },
+        error,
+      );
+    }
   }
 }

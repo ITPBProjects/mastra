@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
+
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
-import type { SaveScorePayload, ScoreRowData, ScoringSource, ValidatedSaveScorePayload } from '@mastra/core/evals';
+import type { ListScoresResponse, SaveScorePayload, ScoreRowData, ScoringSource } from '@mastra/core/evals';
 import { saveScorePayloadSchema } from '@mastra/core/evals';
 import {
   createStorageErrorId,
@@ -10,7 +12,7 @@ import {
   safelyParseJSON,
   transformScoreRow as coreTransformScoreRow,
 } from '@mastra/core/storage';
-import type { PaginationInfo, StoragePagination } from '@mastra/core/storage';
+import type { StoragePagination } from '@mastra/core/storage';
 import type { MongoDBConnector } from '../../connectors/MongoDBConnector';
 import { resolveMongoDBConfig } from '../../db';
 import type { MongoDBDomainConfig, MongoDBIndexConfig } from '../../types';
@@ -130,7 +132,7 @@ export class ScoresStorageMongoDB extends ScoresStorage {
   }
 
   async saveScore(score: SaveScorePayload): Promise<{ score: ScoreRowData }> {
-    let validatedScore: ValidatedSaveScorePayload;
+    let validatedScore: SaveScorePayload;
     try {
       validatedScore = saveScorePayloadSchema.parse(score);
     } catch (error) {
@@ -140,7 +142,7 @@ export class ScoresStorageMongoDB extends ScoresStorage {
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.USER,
           details: {
-            scorer: score.scorer?.id ?? 'unknown',
+            scorer: typeof score.scorer?.id === 'string' ? score.scorer.id : String(score.scorer?.id ?? 'unknown'),
             entityId: score.entityId ?? 'unknown',
             entityType: score.entityType ?? 'unknown',
             traceId: score.traceId ?? '',
@@ -152,7 +154,7 @@ export class ScoresStorageMongoDB extends ScoresStorage {
     }
     try {
       const now = new Date();
-      const scoreId = crypto.randomUUID();
+      const scoreId = randomUUID();
 
       const scorer =
         typeof validatedScore.scorer === 'string' ? safelyParseJSON(validatedScore.scorer) : validatedScore.scorer;
@@ -220,7 +222,7 @@ export class ScoresStorageMongoDB extends ScoresStorage {
     entityId?: string;
     entityType?: string;
     source?: ScoringSource;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
+  }): Promise<ListScoresResponse> {
     try {
       const { page, perPage: perPageInput } = pagination;
       const perPage = normalizePerPage(perPageInput, 100);
@@ -258,7 +260,7 @@ export class ScoresStorageMongoDB extends ScoresStorage {
       const end = perPageInput === false ? total : start + perPage;
 
       // Build query - omit limit() when perPage is false to fetch all results
-      let cursor = collection.find(query).sort({ createdAt: 'desc' }).skip(start);
+      let cursor = collection.find(query).sort({ createdAt: -1 }).skip(start);
 
       if (perPageInput !== false) {
         cursor = cursor.limit(perPage);
@@ -295,7 +297,7 @@ export class ScoresStorageMongoDB extends ScoresStorage {
   }: {
     runId: string;
     pagination: StoragePagination;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
+  }): Promise<ListScoresResponse> {
     try {
       const { page, perPage: perPageInput } = pagination;
       const perPage = normalizePerPage(perPageInput, 100);
@@ -319,7 +321,7 @@ export class ScoresStorageMongoDB extends ScoresStorage {
       const end = perPageInput === false ? total : start + perPage;
 
       // Build query - omit limit() when perPage is false to fetch all results
-      let cursor = collection.find({ runId }).sort({ createdAt: 'desc' }).skip(start);
+      let cursor = collection.find({ runId }).sort({ createdAt: -1 }).skip(start);
 
       if (perPageInput !== false) {
         cursor = cursor.limit(perPage);
@@ -358,7 +360,7 @@ export class ScoresStorageMongoDB extends ScoresStorage {
     pagination: StoragePagination;
     entityId: string;
     entityType: string;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
+  }): Promise<ListScoresResponse> {
     try {
       const { page, perPage: perPageInput } = pagination;
       const perPage = normalizePerPage(perPageInput, 100);
@@ -382,7 +384,7 @@ export class ScoresStorageMongoDB extends ScoresStorage {
       const end = perPageInput === false ? total : start + perPage;
 
       // Build query - omit limit() when perPage is false to fetch all results
-      let cursor = collection.find({ entityId, entityType }).sort({ createdAt: 'desc' }).skip(start);
+      let cursor = collection.find({ entityId, entityType }).sort({ createdAt: -1 }).skip(start);
 
       if (perPageInput !== false) {
         cursor = cursor.limit(perPage);
@@ -421,7 +423,7 @@ export class ScoresStorageMongoDB extends ScoresStorage {
     traceId: string;
     spanId: string;
     pagination: StoragePagination;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
+  }): Promise<ListScoresResponse> {
     try {
       const { page, perPage: perPageInput } = pagination;
       const perPage = normalizePerPage(perPageInput, 100);
@@ -446,7 +448,7 @@ export class ScoresStorageMongoDB extends ScoresStorage {
       const end = perPageInput === false ? total : start + perPage;
 
       // Build query - omit limit() when perPage is false to fetch all results
-      let cursor = collection.find(query).sort({ createdAt: 'desc' }).skip(start);
+      let cursor = collection.find(query).sort({ createdAt: -1 }).skip(start);
 
       if (perPageInput !== false) {
         cursor = cursor.limit(perPage);

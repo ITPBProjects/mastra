@@ -26,7 +26,7 @@
     "@mastra/auth-auth0": "latest",
     "@mastra/auth-workos": "latest",
     "@mastra/auth-clerk": "latest",
-    "hono": "^4.10.4",
+    "hono": "^4.11.3",
     "@hono/node-server": "^1.19.6",
     "express": "^5.1.0",
     "mastra": "latest",
@@ -34,9 +34,9 @@
   },
   "devDependencies": {
     "@types/express": "^5.0.5",
-    "@types/node": "22.13.17",
-    "tsx": "^4.19.3",
-    "typescript": "^5.8.3"
+    "@types/node": "22.19.7",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
   },
   "version": "0.0.1",
   "pnpm": {
@@ -51,7 +51,8 @@
       "@mastra/auth-auth0": "link:../../auth/auth0",
       "@mastra/auth-workos": "link:../../auth/workos",
       "@mastra/auth-clerk": "link:../../auth/clerk",
-      "mastra": "link:../../packages/cli"
+      "mastra": "link:../../packages/cli",
+      "qs": "^6.14.1"
     }
   },
   "packageManager": "pnpm@10.10.0+sha512.d615db246fe70f25dcfea6d8d73dee782ce23e2245e3c4f6f888249fb568149318637dca73c2c5c8ef2a4ca0d5657fb9567188bfab47f566d1ee6ce987815c39"

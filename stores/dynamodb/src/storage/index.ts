@@ -1,27 +1,85 @@
 import { DynamoDBClient, DescribeTableCommand } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
-import type { MastraMessageContentV2 } from '@mastra/core/agent';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
-import type { SaveScorePayload, ScoreRowData, ScoringSource } from '@mastra/core/evals';
-import type { StorageThreadType, MastraDBMessage } from '@mastra/core/memory';
+import type { StorageDomains } from '@mastra/core/storage';
+import { createStorageErrorId, MastraCompositeStore } from '@mastra/core/storage';
 
-import { createStorageErrorId, MastraStorage } from '@mastra/core/storage';
-import type {
-  WorkflowRun,
-  WorkflowRuns,
-  PaginationInfo,
-  StoragePagination,
-  StorageDomains,
-  StorageResourceType,
-  StorageListWorkflowRunsInput,
-  UpdateWorkflowStateOptions,
-} from '@mastra/core/storage';
-import type { StepResult, WorkflowRunState } from '@mastra/core/workflows';
 import type { Service } from 'electrodb';
 import { getElectroDbService } from '../entities';
 import { MemoryStorageDynamoDB } from './domains/memory';
 import { ScoresStorageDynamoDB } from './domains/scores';
 import { WorkflowStorageDynamoDB } from './domains/workflows';
+
+// Export domain classes for direct use with MastraStorage composition
+export { MemoryStorageDynamoDB, ScoresStorageDynamoDB, WorkflowStorageDynamoDB };
+export type { DynamoDBDomainConfig } from './db';
+
+// Export TTL utilities
+export { calculateTtl, getTtlAttributeName, isTtlEnabled, getTtlProps } from './ttl';
+
+/**
+ * Entity names that support TTL configuration.
+ */
+export type DynamoDBTtlEntityName =
+  | 'thread'
+  | 'message'
+  | 'trace'
+  | 'eval'
+  | 'workflow_snapshot'
+  | 'resource'
+  | 'score';
+
+/**
+ * TTL configuration for a single entity type.
+ */
+export interface DynamoDBEntityTtlConfig {
+  /**
+   * Whether TTL is enabled for this entity type.
+   */
+  enabled: boolean;
+  /**
+   * The DynamoDB attribute name to use for TTL.
+   * Must match the TTL attribute configured on your DynamoDB table.
+   * @default 'ttl'
+   */
+  attributeName?: string;
+  /**
+   * Default TTL in seconds from item creation/update time.
+   * Items will be automatically deleted by DynamoDB after this duration.
+   * @example 30 * 24 * 60 * 60 // 30 days
+   */
+  defaultTtlSeconds?: number;
+}
+
+/**
+ * TTL configuration for DynamoDB store.
+ * Configure TTL per entity type for automatic data expiration.
+ *
+ * @example
+ * ```typescript
+ * const store = new DynamoDBStore({
+ *   name: 'my-store',
+ *   config: {
+ *     id: 'my-id',
+ *     tableName: 'my-table',
+ *     ttl: {
+ *       message: {
+ *         enabled: true,
+ *         defaultTtlSeconds: 30 * 24 * 60 * 60, // 30 days
+ *       },
+ *       trace: {
+ *         enabled: true,
+ *         attributeName: 'expiresAt',
+ *         defaultTtlSeconds: 7 * 24 * 60 * 60, // 7 days
+ *       },
+ *     },
+ *   },
+ * });
+ * ```
+ */
+export type DynamoDBTtlConfig = {
+  [EntityKey in DynamoDBTtlEntityName]?: DynamoDBEntityTtlConfig;
+};
 
 /**
  * DynamoDB configuration type.
@@ -53,6 +111,38 @@ export type DynamoDBStoreConfig = {
    * // No auto-init, tables must already exist
    */
   disableInit?: boolean;
+  /**
+   * TTL (Time To Live) configuration for automatic data expiration.
+   *
+   * Configure TTL per entity type to automatically delete items after a specified duration.
+   * DynamoDB TTL is a background process that deletes items within 48 hours after expiration.
+   *
+   * **Important**: TTL must also be enabled on your DynamoDB table via AWS Console or CLI,
+   * specifying the attribute name (default: 'ttl'). The table-level TTL attribute name
+   * must match the `attributeName` in your configuration.
+   *
+   * @example
+   * ```typescript
+   * const store = new DynamoDBStore({
+   *   name: 'my-store',
+   *   config: {
+   *     id: 'my-id',
+   *     tableName: 'my-table',
+   *     ttl: {
+   *       message: {
+   *         enabled: true,
+   *         defaultTtlSeconds: 30 * 24 * 60 * 60, // 30 days
+   *       },
+   *       trace: {
+   *         enabled: true,
+   *         defaultTtlSeconds: 7 * 24 * 60 * 60, // 7 days
+   *       },
+   *     },
+   *   },
+   * });
+   * ```
+   */
+  ttl?: DynamoDBTtlConfig;
 } & (
   | {
       /**
@@ -107,10 +197,29 @@ type MastraService = Service<Record<string, any>> & {
   [key: string]: any;
 };
 
-export class DynamoDBStore extends MastraStorage {
+/**
+ * DynamoDB storage adapter for Mastra.
+ *
+ * Access domain-specific storage via `getStore()`:
+ *
+ * @example
+ * ```typescript
+ * const storage = new DynamoDBStore({ name: 'my-store', config: { id: 'my-id', tableName: 'my-table' } });
+ *
+ * // Access memory domain
+ * const memory = await storage.getStore('memory');
+ * await memory?.saveThread({ thread });
+ *
+ * // Access workflows domain
+ * const workflows = await storage.getStore('workflows');
+ * await workflows?.persistWorkflowSnapshot({ workflowName, runId, snapshot });
+ * ```
+ */
+export class DynamoDBStore extends MastraCompositeStore {
   private tableName: string;
   private client: DynamoDBDocumentClient;
   private service: MastraService;
+  private ttlConfig?: DynamoDBTtlConfig;
   protected hasInitialized: Promise<boolean> | null = null;
   stores: StorageDomains;
 
@@ -130,6 +239,7 @@ export class DynamoDBStore extends MastraStorage {
       }
 
       this.tableName = config.tableName;
+      this.ttlConfig = config.ttl;
 
       // Handle pre-configured client vs creating new connection
       if (isClientConfig(config)) {
@@ -147,7 +257,7 @@ export class DynamoDBStore extends MastraStorage {
 
       this.service = getElectroDbService(this.client, this.tableName) as MastraService;
 
-      const domainConfig = { service: this.service };
+      const domainConfig = { service: this.service, ttl: this.ttlConfig };
       const workflows = new WorkflowStorageDynamoDB(domainConfig);
       const memory = new MemoryStorageDynamoDB(domainConfig);
       const scores = new ScoresStorageDynamoDB(domainConfig);
@@ -170,17 +280,6 @@ export class DynamoDBStore extends MastraStorage {
 
     // We're using a single table design with ElectroDB,
     // so we don't need to create multiple tables
-  }
-
-  get supports() {
-    return {
-      selectByIncludeResourceScope: true,
-      resourceWorkingMemory: true,
-      hasColumn: false,
-      createTable: false,
-      deleteMessages: true,
-      listScoresBySpan: true,
-    };
   }
 
   /**
@@ -275,137 +374,6 @@ export class DynamoDBStore extends MastraStorage {
       });
   }
 
-  // Thread operations
-  async getThreadById({ threadId }: { threadId: string }): Promise<StorageThreadType | null> {
-    return this.stores.memory.getThreadById({ threadId });
-  }
-
-  async saveThread({ thread }: { thread: StorageThreadType }): Promise<StorageThreadType> {
-    return this.stores.memory.saveThread({ thread });
-  }
-
-  async updateThread({
-    id,
-    title,
-    metadata,
-  }: {
-    id: string;
-    title: string;
-    metadata: Record<string, unknown>;
-  }): Promise<StorageThreadType> {
-    return this.stores.memory.updateThread({ id, title, metadata });
-  }
-
-  async deleteThread({ threadId }: { threadId: string }): Promise<void> {
-    return this.stores.memory.deleteThread({ threadId });
-  }
-
-  async listMessagesById(args: { messageIds: string[] }): Promise<{ messages: MastraDBMessage[] }> {
-    return this.stores.memory.listMessagesById(args);
-  }
-
-  async saveMessages(args: { messages: MastraDBMessage[] }): Promise<{ messages: MastraDBMessage[] }> {
-    return this.stores.memory.saveMessages(args);
-  }
-
-  async updateMessages(_args: {
-    messages: (Partial<Omit<MastraDBMessage, 'createdAt'>> & {
-      id: string;
-      content?: { metadata?: MastraMessageContentV2['metadata']; content?: MastraMessageContentV2['content'] };
-    })[];
-  }): Promise<MastraDBMessage[]> {
-    return this.stores.memory.updateMessages(_args);
-  }
-
-  async deleteMessages(messageIds: string[]): Promise<void> {
-    return this.stores.memory.deleteMessages(messageIds);
-  }
-
-  // Workflow operations
-  async updateWorkflowResults({
-    workflowName,
-    runId,
-    stepId,
-    result,
-    requestContext,
-  }: {
-    workflowName: string;
-    runId: string;
-    stepId: string;
-    result: StepResult<any, any, any, any>;
-    requestContext: Record<string, any>;
-  }): Promise<Record<string, StepResult<any, any, any, any>>> {
-    return this.stores.workflows.updateWorkflowResults({ workflowName, runId, stepId, result, requestContext });
-  }
-
-  async updateWorkflowState({
-    workflowName,
-    runId,
-    opts,
-  }: {
-    workflowName: string;
-    runId: string;
-    opts: UpdateWorkflowStateOptions;
-  }): Promise<WorkflowRunState | undefined> {
-    return this.stores.workflows.updateWorkflowState({ workflowName, runId, opts });
-  }
-
-  async persistWorkflowSnapshot({
-    workflowName,
-    runId,
-    resourceId,
-    snapshot,
-  }: {
-    workflowName: string;
-    runId: string;
-    resourceId?: string;
-    snapshot: WorkflowRunState;
-  }): Promise<void> {
-    return this.stores.workflows.persistWorkflowSnapshot({ workflowName, runId, resourceId, snapshot });
-  }
-
-  async loadWorkflowSnapshot({
-    workflowName,
-    runId,
-  }: {
-    workflowName: string;
-    runId: string;
-  }): Promise<WorkflowRunState | null> {
-    return this.stores.workflows.loadWorkflowSnapshot({ workflowName, runId });
-  }
-
-  async listWorkflowRuns(args?: StorageListWorkflowRunsInput): Promise<WorkflowRuns> {
-    return this.stores.workflows.listWorkflowRuns(args);
-  }
-
-  async getWorkflowRunById(args: { runId: string; workflowName?: string }): Promise<WorkflowRun | null> {
-    return this.stores.workflows.getWorkflowRunById(args);
-  }
-
-  async deleteWorkflowRunById({ runId, workflowName }: { runId: string; workflowName: string }): Promise<void> {
-    return this.stores.workflows.deleteWorkflowRunById({ runId, workflowName });
-  }
-
-  async getResourceById({ resourceId }: { resourceId: string }): Promise<StorageResourceType | null> {
-    return this.stores.memory.getResourceById({ resourceId });
-  }
-
-  async saveResource({ resource }: { resource: StorageResourceType }): Promise<StorageResourceType> {
-    return this.stores.memory.saveResource({ resource });
-  }
-
-  async updateResource({
-    resourceId,
-    workingMemory,
-    metadata,
-  }: {
-    resourceId: string;
-    workingMemory?: string;
-    metadata?: Record<string, any>;
-  }): Promise<StorageResourceType> {
-    return this.stores.memory.updateResource({ resourceId, workingMemory, metadata });
-  }
-
   /**
    * Closes the DynamoDB client connection and cleans up resources.
    *
@@ -426,69 +394,5 @@ export class DynamoDBStore extends MastraStorage {
         error,
       );
     }
-  }
-  /**
-   * SCORERS - Not implemented
-   */
-  async getScoreById({ id: _id }: { id: string }): Promise<ScoreRowData | null> {
-    return this.stores.scores.getScoreById({ id: _id });
-  }
-
-  async saveScore(score: SaveScorePayload): Promise<{ score: ScoreRowData }> {
-    return this.stores.scores.saveScore(score);
-  }
-
-  async listScoresByRunId({
-    runId: _runId,
-    pagination: _pagination,
-  }: {
-    runId: string;
-    pagination: StoragePagination;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
-    return this.stores.scores.listScoresByRunId({ runId: _runId, pagination: _pagination });
-  }
-
-  async listScoresByEntityId({
-    entityId: _entityId,
-    entityType: _entityType,
-    pagination: _pagination,
-  }: {
-    pagination: StoragePagination;
-    entityId: string;
-    entityType: string;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
-    return this.stores.scores.listScoresByEntityId({
-      entityId: _entityId,
-      entityType: _entityType,
-      pagination: _pagination,
-    });
-  }
-
-  async listScoresByScorerId({
-    scorerId,
-    source,
-    entityId,
-    entityType,
-    pagination,
-  }: {
-    scorerId: string;
-    entityId?: string;
-    entityType?: string;
-    source?: ScoringSource;
-    pagination: StoragePagination;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
-    return this.stores.scores.listScoresByScorerId({ scorerId, source, entityId, entityType, pagination });
-  }
-
-  async listScoresBySpan({
-    traceId,
-    spanId,
-    pagination,
-  }: {
-    traceId: string;
-    spanId: string;
-    pagination: StoragePagination;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
-    return this.stores.scores.listScoresBySpan({ traceId, spanId, pagination });
   }
 }

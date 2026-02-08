@@ -44,7 +44,7 @@ if (!deploymentUrl || !adminKey) {
     ...(storageFunction ? { storageFunction } : {}),
   });
 
-  createTestSuite(store);
+  createTestSuite(store, { listScoresBySpan: false });
 
   // Pre-configured client acceptance tests
   createClientAcceptanceTests({
@@ -152,6 +152,20 @@ describe('Convex Schema Sync', () => {
     const missingFields = coreFields.filter(field => !convexFields.includes(field));
 
     expect(missingFields).toEqual([]);
+  });
+
+  // Issue #12318: mastra_workflow_snapshots index references missing id field
+  // The Convex schema defines an index 'by_record_id' on ['id'] for the workflow snapshots table.
+  // The core TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT] uses a composite key (workflow_name, run_id)
+  // and doesn't include an 'id' field. The Convex adapter adds 'id' explicitly to support the index,
+  // and generates the id value at runtime as `${workflow_name}-${run_id}` in normalizeRecord().
+  it('mastraWorkflowSnapshotsTable should include id field for by_record_id index', async () => {
+    const { mastraWorkflowSnapshotsTable } = await import('../schema');
+
+    // Verify the Convex table includes the id field (added explicitly in schema.ts)
+    const convexValidator = (mastraWorkflowSnapshotsTable as any).validator;
+    const convexFields = convexValidator ? Object.keys(convexValidator.fields || {}) : [];
+    expect(convexFields).toContain('id');
   });
 });
 

@@ -1,6 +1,8 @@
 ---
 title: "Reference: Step Class | Workflows"
 description: Documentation for the Step class in Mastra, which defines individual units of work within a workflow.
+packages:
+  - "@mastra/core"
 ---
 
 # Step Class
@@ -131,10 +133,23 @@ const agentStep = createStep(testAgent, {
       required: false,
     },
     {
+      name: "requestContextSchema",
+      type: "z.ZodType<any>",
+      description:
+        "Zod schema for validating request context values. When provided, the context is validated before the step's execute() runs, failing the step if validation fails.",
+      required: false,
+    },
+    {
       name: "execute",
       type: "(params: ExecuteParams) => Promise<any>",
       description: "Async function containing step logic",
       required: true,
+    },
+    {
+      name: "metadata",
+      type: "Record<string, any>",
+      description: "Optional key-value pairs for storing additional step information. Values must be serializable (no functions, circular references, etc.).",
+      required: false,
     },
   ]}
 />
@@ -206,10 +221,10 @@ const agentStep = createStep(testAgent, {
         "Request Context for dependency injection and contextual information.",
     },
     {
-      name: "runCount",
+      name: "retryCount",
       type: "number",
       description:
-        "The run count for this specific step, it automatically increases each time the step runs",
+        "The retry count for this specific step, it automatically increases each time the step is retried",
       isOptional: true,
     },
   ]}
@@ -217,6 +232,6 @@ const agentStep = createStep(testAgent, {
 
 ## Related
 
-- [Workflow state](/docs/v1/workflows/workflow-state)
-- [Control flow](/docs/v1/workflows/control-flow)
-- [Using agents and tools](/docs/v1/workflows/agents-and-tools)
+- [Workflow state](/docs/workflows/workflow-state)
+- [Control flow](/docs/workflows/control-flow)
+- [Using agents and tools](/docs/workflows/agents-and-tools)

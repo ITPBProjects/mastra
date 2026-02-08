@@ -1,6 +1,8 @@
 ---
 title: "Reference: Prompt Alignment Scorer | Evals"
 description: Documentation for the Prompt Alignment Scorer in Mastra. Evaluates how well agent responses align with user prompt intent, requirements, completeness, and appropriateness using multi-dimensional analysis.
+packages:
+  - "@mastra/evals"
 ---
 
 import PropertiesTable from "@site/src/components/PropertiesTable";
@@ -662,7 +664,7 @@ const result = await scorer.run({
 
 ## Related
 
-- [Answer Relevancy Scorer](/reference/v1/evals/answer-relevancy) - Evaluates query-response relevance
-- [Faithfulness Scorer](/reference/v1/evals/faithfulness) - Measures context groundedness
-- [Tool Call Accuracy Scorer](/reference/v1/evals/tool-call-accuracy) - Evaluates tool selection
-- [Custom Scorers](/docs/v1/evals/custom-scorers) - Creating your own evaluation metrics
+- [Answer Relevancy Scorer](/reference/evals/answer-relevancy) - Evaluates query-response relevance
+- [Faithfulness Scorer](/reference/evals/faithfulness) - Measures context groundedness
+- [Tool Call Accuracy Scorer](/reference/evals/tool-call-accuracy) - Evaluates tool selection
+- [Custom Scorers](/docs/evals/custom-scorers) - Creating your own evaluation metrics

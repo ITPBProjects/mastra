@@ -14,10 +14,10 @@ export function createOnScorerHook(mastra: Mastra) {
       return;
     }
 
-    const entityId = hookData.entity.id;
+    const entityId = hookData.entity.id as string;
     const entityType = hookData.entityType;
     const scorer = hookData.scorer;
-    const scorerId = scorer.id;
+    const scorerId = scorer.id as string;
 
     if (!scorerId) {
       mastra.getLogger()?.warn('Scorer ID not found, skipping score validation and saving');
@@ -100,7 +100,7 @@ export function createOnScorerHook(mastra: Mastra) {
           domain: ErrorDomain.SCORER,
           category: ErrorCategory.USER,
           details: {
-            scorerId: scorer.id,
+            scorerId,
             entityId,
             entityType,
           },
@@ -115,18 +115,47 @@ export function createOnScorerHook(mastra: Mastra) {
 }
 
 export async function validateAndSaveScore(storage: MastraStorage, payload: unknown) {
+  const scoresStore = await storage.getStore('scores');
+  if (!scoresStore) {
+    throw new MastraError({
+      id: 'MASTRA_SCORES_STORAGE_NOT_AVAILABLE',
+      domain: ErrorDomain.STORAGE,
+      category: ErrorCategory.SYSTEM,
+      text: 'Scores storage domain is not available',
+    });
+  }
   const payloadToSave = saveScorePayloadSchema.parse(payload);
-  await storage?.saveScore(payloadToSave);
+  await scoresStore.saveScore(payloadToSave);
 }
 
 async function findScorer(mastra: Mastra, entityId: string, entityType: string, scorerId: string) {
   let scorerToUse;
   if (entityType === 'AGENT') {
-    const scorers = await mastra.getAgentById(entityId).listScorers();
-    for (const [_, scorer] of Object.entries(scorers)) {
-      if (scorer.scorer.id === scorerId) {
-        scorerToUse = scorer;
-        break;
+    // Try code-defined agents first
+    try {
+      const agent = mastra.getAgentById(entityId);
+      const scorers = await agent.listScorers();
+      for (const [_, scorer] of Object.entries(scorers)) {
+        if (scorer.scorer.id === scorerId) {
+          scorerToUse = scorer;
+          break;
+        }
+      }
+    } catch {
+      // Agent not found in code-defined agents, try stored agents via editor
+      try {
+        const storedAgent = (await mastra.getEditor()?.getStoredAgentById(entityId)) ?? null;
+        if (storedAgent) {
+          const scorers = await storedAgent.listScorers();
+          for (const [_, scorer] of Object.entries(scorers) as [string, any][]) {
+            if (scorer.scorer.id === scorerId) {
+              scorerToUse = scorer;
+              break;
+            }
+          }
+        }
+      } catch {
+        // Stored agent also not found, will fall back to mastra-registered scorer
       }
     }
   } else if (entityType === 'WORKFLOW') {

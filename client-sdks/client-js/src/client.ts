@@ -1,11 +1,13 @@
+import type { ListScoresResponse } from '@mastra/core/evals';
 import type { ServerDetailInfo } from '@mastra/core/mcp';
 import type { RequestContext } from '@mastra/core/request-context';
-import type { TraceRecord, TracesPaginatedArg } from '@mastra/core/storage';
+import type { TraceRecord, ListTracesArgs, ListTracesResponse } from '@mastra/core/storage';
 import type { WorkflowInfo } from '@mastra/core/workflows';
 import {
   Agent,
   MemoryThread,
   Tool,
+  Processor,
   Workflow,
   Vector,
   BaseResource,
@@ -14,7 +16,13 @@ import {
   AgentBuilder,
   Observability,
   StoredAgent,
+  Workspace,
 } from './resources';
+import type {
+  ListScoresBySpanParams,
+  LegacyTracesPaginatedArg,
+  LegacyGetTracesResponse,
+} from './resources/observability';
 import type {
   ClientOptions,
   CreateMemoryThreadParams,
@@ -24,6 +32,7 @@ import type {
   GetLogsParams,
   GetLogsResponse,
   GetToolResponse,
+  GetProcessorResponse,
   GetWorkflowResponse,
   SaveMessageToMemoryParams,
   SaveMessageToMemoryResponse,
@@ -31,13 +40,10 @@ import type {
   McpServerToolListResponse,
   GetScorerResponse,
   ListScoresByScorerIdParams,
-  ListScoresResponse,
   ListScoresByRunIdParams,
   ListScoresByEntityIdParams,
-  ListScoresBySpanParams,
   SaveScoreParams,
   SaveScoreResponse,
-  GetTracesResponse,
   GetMemoryConfigParams,
   GetMemoryConfigResponse,
   ListMemoryThreadMessagesResponse,
@@ -50,6 +56,13 @@ import type {
   CreateStoredAgentParams,
   StoredAgentResponse,
   GetSystemPackagesResponse,
+  ListScoresResponse as ListScoresResponseOld,
+  GetObservationalMemoryParams,
+  GetObservationalMemoryResponse,
+  GetMemoryStatusResponse,
+  ListWorkspacesResponse,
+  ListVectorsResponse,
+  ListEmbeddersResponse,
 } from './types';
 import { base64RequestContext, parseClientRequestContext, requestContextQueryString } from './utils';
 
@@ -82,11 +95,11 @@ export class MastraClient extends BaseResource {
     }
 
     const queryString = searchParams.toString();
-    return this.request(`/api/agents${queryString ? `?${queryString}` : ''}`);
+    return this.request(`/agents${queryString ? `?${queryString}` : ''}`);
   }
 
   public listAgentsModelProviders(): Promise<ListAgentsModelProvidersResponse> {
-    return this.request(`/api/agents/providers`);
+    return this.request(`/agents/providers`);
   }
 
   /**
@@ -99,23 +112,32 @@ export class MastraClient extends BaseResource {
   }
 
   /**
-   * Lists memory threads for a resource with pagination support
-   * @param params - Parameters containing resource ID, pagination options, and optional request context
+   * Lists memory threads with optional filtering by resourceId and/or metadata
+   * @param params - Parameters containing optional filters, pagination options, and request context
    * @returns Promise containing paginated array of memory threads with metadata
    */
-  public async listMemoryThreads(params: ListMemoryThreadsParams): Promise<ListMemoryThreadsResponse> {
-    const queryParams = new URLSearchParams({
-      resourceId: params.resourceId,
-      resourceid: params.resourceId,
-      agentId: params.agentId,
-      ...(params.page !== undefined && { page: params.page.toString() }),
-      ...(params.perPage !== undefined && { perPage: params.perPage.toString() }),
-      ...(params.orderBy && { orderBy: params.orderBy }),
-      ...(params.sortDirection && { sortDirection: params.sortDirection }),
-    });
+  public async listMemoryThreads(params: ListMemoryThreadsParams = {}): Promise<ListMemoryThreadsResponse> {
+    const queryParams = new URLSearchParams();
 
+    // Add resourceId if provided (backwards compatible - also add lowercase version)
+    if (params.resourceId) {
+      queryParams.set('resourceId', params.resourceId);
+    }
+
+    // Add metadata filter as JSON string if provided
+    if (params.metadata) {
+      queryParams.set('metadata', JSON.stringify(params.metadata));
+    }
+
+    if (params.agentId) queryParams.set('agentId', params.agentId);
+    if (params.page !== undefined) queryParams.set('page', params.page.toString());
+    if (params.perPage !== undefined) queryParams.set('perPage', params.perPage.toString());
+    if (params.orderBy) queryParams.set('orderBy', params.orderBy);
+    if (params.sortDirection) queryParams.set('sortDirection', params.sortDirection);
+
+    const queryString = queryParams.toString();
     const response: ListMemoryThreadsResponse | ListMemoryThreadsResponse['threads'] = await this.request(
-      `/api/memory/threads?${queryParams.toString()}${requestContextQueryString(params.requestContext, '&')}`,
+      `/memory/threads${queryString ? `?${queryString}` : ''}${requestContextQueryString(params.requestContext, queryString ? '&' : '?')}`,
     );
 
     const actualResponse: ListMemoryThreadsResponse =
@@ -139,7 +161,7 @@ export class MastraClient extends BaseResource {
    */
   public getMemoryConfig(params: GetMemoryConfigParams): Promise<GetMemoryConfigResponse> {
     return this.request(
-      `/api/memory/config?agentId=${params.agentId}${requestContextQueryString(params.requestContext, '&')}`,
+      `/memory/config?agentId=${params.agentId}${requestContextQueryString(params.requestContext, '&')}`,
     );
   }
 
@@ -150,7 +172,7 @@ export class MastraClient extends BaseResource {
    */
   public createMemoryThread(params: CreateMemoryThreadParams): Promise<CreateMemoryThreadResponse> {
     return this.request(
-      `/api/memory/threads?agentId=${params.agentId}${requestContextQueryString(params.requestContext, '&')}`,
+      `/memory/threads?agentId=${params.agentId}${requestContextQueryString(params.requestContext, '&')}`,
       { method: 'POST', body: params },
     );
   }
@@ -158,24 +180,33 @@ export class MastraClient extends BaseResource {
   /**
    * Gets a memory thread instance by ID
    * @param threadId - ID of the memory thread to retrieve
+   * @param agentId - Optional agent ID. When not provided, uses storage directly
    * @returns MemoryThread instance
    */
-  public getMemoryThread({ threadId, agentId }: { threadId: string; agentId: string }) {
+  public getMemoryThread({ threadId, agentId }: { threadId: string; agentId?: string }) {
     return new MemoryThread(this.options, threadId, agentId);
   }
 
+  /**
+   * Lists messages for a thread.
+   * @param threadId - ID of the thread
+   * @param opts - Optional parameters including agentId, networkId, and requestContext
+   *   - When agentId is provided, uses the agent's memory
+   *   - When networkId is provided, uses the network endpoint
+   *   - When neither is provided, uses storage directly
+   * @returns Promise containing the thread messages
+   */
   public listThreadMessages(
     threadId: string,
     opts: { agentId?: string; networkId?: string; requestContext?: RequestContext | Record<string, any> } = {},
   ): Promise<ListMemoryThreadMessagesResponse> {
-    if (!opts.agentId && !opts.networkId) {
-      throw new Error('Either agentId or networkId must be provided');
-    }
     let url = '';
-    if (opts.agentId) {
-      url = `/api/memory/threads/${threadId}/messages?agentId=${opts.agentId}${requestContextQueryString(opts.requestContext, '&')}`;
-    } else if (opts.networkId) {
-      url = `/api/memory/network/threads/${threadId}/messages?networkId=${opts.networkId}${requestContextQueryString(opts.requestContext, '&')}`;
+    if (opts.networkId) {
+      url = `/memory/network/threads/${threadId}/messages?networkId=${opts.networkId}${requestContextQueryString(opts.requestContext, '&')}`;
+    } else if (opts.agentId) {
+      url = `/memory/threads/${threadId}/messages?agentId=${opts.agentId}${requestContextQueryString(opts.requestContext, '&')}`;
+    } else {
+      url = `/memory/threads/${threadId}/messages${requestContextQueryString(opts.requestContext, '?')}`;
     }
     return this.request(url);
   }
@@ -187,9 +218,9 @@ export class MastraClient extends BaseResource {
     let url = '';
 
     if (opts.agentId) {
-      url = `/api/memory/threads/${threadId}?agentId=${opts.agentId}${requestContextQueryString(opts.requestContext, '&')}`;
+      url = `/memory/threads/${threadId}?agentId=${opts.agentId}${requestContextQueryString(opts.requestContext, '&')}`;
     } else if (opts.networkId) {
-      url = `/api/memory/network/threads/${threadId}?networkId=${opts.networkId}${requestContextQueryString(opts.requestContext, '&')}`;
+      url = `/memory/network/threads/${threadId}?networkId=${opts.networkId}${requestContextQueryString(opts.requestContext, '&')}`;
     }
     return this.request(url, { method: 'DELETE' });
   }
@@ -201,7 +232,7 @@ export class MastraClient extends BaseResource {
    */
   public saveMessageToMemory(params: SaveMessageToMemoryParams): Promise<SaveMessageToMemoryResponse> {
     return this.request(
-      `/api/memory/save-messages?agentId=${params.agentId}${requestContextQueryString(params.requestContext, '&')}`,
+      `/memory/save-messages?agentId=${params.agentId}${requestContextQueryString(params.requestContext, '&')}`,
       {
         method: 'POST',
         body: params,
@@ -212,14 +243,37 @@ export class MastraClient extends BaseResource {
   /**
    * Gets the status of the memory system
    * @param agentId - The agent ID
-   * @param requestContext - Optional request context to pass as query parameter
-   * @returns Promise containing memory system status
+   * @param opts - Optional parameters including resourceId, threadId, and requestContext
+   * @returns Promise containing memory system status including observational memory info
    */
   public getMemoryStatus(
     agentId: string,
     requestContext?: RequestContext | Record<string, any>,
-  ): Promise<{ result: boolean }> {
-    return this.request(`/api/memory/status?agentId=${agentId}${requestContextQueryString(requestContext, '&')}`);
+    opts?: {
+      resourceId?: string;
+      threadId?: string;
+    },
+  ): Promise<GetMemoryStatusResponse> {
+    const queryParams = new URLSearchParams({ agentId });
+    if (opts?.resourceId) queryParams.set('resourceId', opts.resourceId);
+    if (opts?.threadId) queryParams.set('threadId', opts.threadId);
+    const queryString = queryParams.toString();
+    return this.request(`/memory/status?${queryString}${requestContextQueryString(requestContext, '&')}`);
+  }
+
+  /**
+   * Gets observational memory data for a resource or thread
+   * @param params - Parameters containing agentId, resourceId, threadId, and optional request context
+   * @returns Promise containing the current OM record and history
+   */
+  public getObservationalMemory(params: GetObservationalMemoryParams): Promise<GetObservationalMemoryResponse> {
+    const queryParams = new URLSearchParams({ agentId: params.agentId });
+    if (params.resourceId) queryParams.set('resourceId', params.resourceId);
+    if (params.threadId) queryParams.set('threadId', params.threadId);
+    const queryString = queryParams.toString();
+    return this.request(
+      `/memory/observational-memory?${queryString}${requestContextQueryString(params.requestContext, '&')}`,
+    );
   }
 
   /**
@@ -237,7 +291,7 @@ export class MastraClient extends BaseResource {
     }
 
     const queryString = searchParams.toString();
-    return this.request(`/api/tools${queryString ? `?${queryString}` : ''}`);
+    return this.request(`/tools${queryString ? `?${queryString}` : ''}`);
   }
 
   /**
@@ -247,6 +301,35 @@ export class MastraClient extends BaseResource {
    */
   public getTool(toolId: string) {
     return new Tool(this.options, toolId);
+  }
+
+  /**
+   * Retrieves all available processors
+   * @param requestContext - Optional request context to pass as query parameter
+   * @returns Promise containing map of processor IDs to processor details
+   */
+  public listProcessors(
+    requestContext?: RequestContext | Record<string, any>,
+  ): Promise<Record<string, GetProcessorResponse>> {
+    const requestContextParam = base64RequestContext(parseClientRequestContext(requestContext));
+
+    const searchParams = new URLSearchParams();
+
+    if (requestContextParam) {
+      searchParams.set('requestContext', requestContextParam);
+    }
+
+    const queryString = searchParams.toString();
+    return this.request(`/processors${queryString ? `?${queryString}` : ''}`);
+  }
+
+  /**
+   * Gets a processor instance by ID
+   * @param processorId - ID of the processor to retrieve
+   * @returns Processor instance
+   */
+  public getProcessor(processorId: string) {
+    return new Processor(this.options, processorId);
   }
 
   /**
@@ -271,7 +354,7 @@ export class MastraClient extends BaseResource {
     }
 
     const queryString = searchParams.toString();
-    return this.request(`/api/workflows${queryString ? `?${queryString}` : ''}`);
+    return this.request(`/workflows${queryString ? `?${queryString}` : ''}`);
   }
 
   /**
@@ -288,7 +371,7 @@ export class MastraClient extends BaseResource {
    * @returns Promise containing map of action IDs to action details
    */
   public getAgentBuilderActions(): Promise<Record<string, WorkflowInfo>> {
-    return this.request('/api/agent-builder/');
+    return this.request('/agent-builder/');
   }
 
   /**
@@ -347,9 +430,9 @@ export class MastraClient extends BaseResource {
     }
 
     if (searchParams.size) {
-      return this.request(`/api/logs?${searchParams}`);
+      return this.request(`/logs?${searchParams}`);
     } else {
-      return this.request(`/api/logs`);
+      return this.request(`/logs`);
     }
   }
 
@@ -396,9 +479,9 @@ export class MastraClient extends BaseResource {
     }
 
     if (searchParams.size) {
-      return this.request(`/api/logs/${runId}?${searchParams}`);
+      return this.request(`/logs/${runId}?${searchParams}`);
     } else {
-      return this.request(`/api/logs/${runId}`);
+      return this.request(`/logs/${runId}`);
     }
   }
 
@@ -407,7 +490,7 @@ export class MastraClient extends BaseResource {
    * @returns Promise containing list of log transports
    */
   public listLogTransports(): Promise<{ transports: string[] }> {
-    return this.request('/api/logs/transports');
+    return this.request('/logs/transports');
   }
 
   /**
@@ -438,7 +521,7 @@ export class MastraClient extends BaseResource {
       searchParams.set('offset', String(params.offset));
     }
     const queryString = searchParams.toString();
-    return this.request(`/api/mcp/v0/servers${queryString ? `?${queryString}` : ''}`);
+    return this.request(`/mcp/v0/servers${queryString ? `?${queryString}` : ''}`);
   }
 
   /**
@@ -453,7 +536,7 @@ export class MastraClient extends BaseResource {
       searchParams.set('version', params.version);
     }
     const queryString = searchParams.toString();
-    return this.request(`/api/mcp/v0/servers/${serverId}${queryString ? `?${queryString}` : ''}`);
+    return this.request(`/mcp/v0/servers/${serverId}${queryString ? `?${queryString}` : ''}`);
   }
 
   /**
@@ -462,7 +545,7 @@ export class MastraClient extends BaseResource {
    * @returns Promise containing the list of tools.
    */
   public getMcpServerTools(serverId: string): Promise<McpServerToolListResponse> {
-    return this.request(`/api/mcp/${serverId}/tools`);
+    return this.request(`/mcp/${serverId}/tools`);
   }
 
   /**
@@ -504,7 +587,7 @@ export class MastraClient extends BaseResource {
     requestContext?: RequestContext | Record<string, any>;
   }) {
     return this.request(
-      `/api/memory/threads/${threadId}/working-memory?agentId=${agentId}&resourceId=${resourceId}${requestContextQueryString(requestContext, '&')}`,
+      `/memory/threads/${threadId}/working-memory?agentId=${agentId}&resourceId=${resourceId}${requestContextQueryString(requestContext, '&')}`,
     );
   }
 
@@ -537,7 +620,7 @@ export class MastraClient extends BaseResource {
       params.append('memoryConfig', JSON.stringify(memoryConfig));
     }
 
-    return this.request(`/api/memory/search?${params}${requestContextQueryString(requestContext, '&')}`);
+    return this.request(`/memory/search?${params}${requestContextQueryString(requestContext, '&')}`);
   }
 
   /**
@@ -561,7 +644,7 @@ export class MastraClient extends BaseResource {
     requestContext?: RequestContext | Record<string, any>;
   }) {
     return this.request(
-      `/api/memory/threads/${threadId}/working-memory?agentId=${agentId}${requestContextQueryString(requestContext, '&')}`,
+      `/memory/threads/${threadId}/working-memory?agentId=${agentId}${requestContextQueryString(requestContext, '&')}`,
       {
         method: 'POST',
         body: {
@@ -577,7 +660,7 @@ export class MastraClient extends BaseResource {
    * @returns Promise containing list of available scorers
    */
   public listScorers(): Promise<Record<string, GetScorerResponse>> {
-    return this.request('/api/scores/scorers');
+    return this.request('/scores/scorers');
   }
 
   /**
@@ -586,10 +669,10 @@ export class MastraClient extends BaseResource {
    * @returns Promise containing the scorer
    */
   public getScorer(scorerId: string): Promise<GetScorerResponse> {
-    return this.request(`/api/scores/scorers/${encodeURIComponent(scorerId)}`);
+    return this.request(`/scores/scorers/${encodeURIComponent(scorerId)}`);
   }
 
-  public listScoresByScorerId(params: ListScoresByScorerIdParams): Promise<ListScoresResponse> {
+  public listScoresByScorerId(params: ListScoresByScorerIdParams): Promise<ListScoresResponseOld> {
     const { page, perPage, scorerId, entityId, entityType } = params;
     const searchParams = new URLSearchParams();
 
@@ -607,7 +690,7 @@ export class MastraClient extends BaseResource {
       searchParams.set('perPage', String(perPage));
     }
     const queryString = searchParams.toString();
-    return this.request(`/api/scores/scorer/${encodeURIComponent(scorerId)}${queryString ? `?${queryString}` : ''}`);
+    return this.request(`/scores/scorer/${encodeURIComponent(scorerId)}${queryString ? `?${queryString}` : ''}`);
   }
 
   /**
@@ -615,7 +698,7 @@ export class MastraClient extends BaseResource {
    * @param params - Parameters containing run ID and pagination options
    * @returns Promise containing scores and pagination info
    */
-  public listScoresByRunId(params: ListScoresByRunIdParams): Promise<ListScoresResponse> {
+  public listScoresByRunId(params: ListScoresByRunIdParams): Promise<ListScoresResponseOld> {
     const { runId, page, perPage } = params;
     const searchParams = new URLSearchParams();
 
@@ -627,7 +710,7 @@ export class MastraClient extends BaseResource {
     }
 
     const queryString = searchParams.toString();
-    return this.request(`/api/scores/run/${encodeURIComponent(runId)}${queryString ? `?${queryString}` : ''}`);
+    return this.request(`/scores/run/${encodeURIComponent(runId)}${queryString ? `?${queryString}` : ''}`);
   }
 
   /**
@@ -635,7 +718,7 @@ export class MastraClient extends BaseResource {
    * @param params - Parameters containing entity ID, type, and pagination options
    * @returns Promise containing scores and pagination info
    */
-  public listScoresByEntityId(params: ListScoresByEntityIdParams): Promise<ListScoresResponse> {
+  public listScoresByEntityId(params: ListScoresByEntityIdParams): Promise<ListScoresResponseOld> {
     const { entityId, entityType, page, perPage } = params;
     const searchParams = new URLSearchParams();
 
@@ -648,7 +731,7 @@ export class MastraClient extends BaseResource {
 
     const queryString = searchParams.toString();
     return this.request(
-      `/api/scores/entity/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}${queryString ? `?${queryString}` : ''}`,
+      `/scores/entity/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}${queryString ? `?${queryString}` : ''}`,
     );
   }
 
@@ -658,7 +741,7 @@ export class MastraClient extends BaseResource {
    * @returns Promise containing the saved score
    */
   public saveScore(params: SaveScoreParams): Promise<SaveScoreResponse> {
-    return this.request('/api/scores', {
+    return this.request('/scores', {
       method: 'POST',
       body: params,
     });
@@ -668,8 +751,27 @@ export class MastraClient extends BaseResource {
     return this.observability.getTrace(traceId);
   }
 
-  getTraces(params: TracesPaginatedArg): Promise<GetTracesResponse> {
+  /**
+   * Retrieves paginated list of traces with optional filtering.
+   * This is the legacy API preserved for backward compatibility.
+   *
+   * @param params - Parameters for pagination and filtering (legacy format)
+   * @returns Promise containing paginated traces and pagination info
+   * @deprecated Use {@link listTraces} instead for new features like ordering and more filters.
+   */
+  getTraces(params: LegacyTracesPaginatedArg): Promise<LegacyGetTracesResponse> {
     return this.observability.getTraces(params);
+  }
+
+  /**
+   * Retrieves paginated list of traces with optional filtering and sorting.
+   * This is the new API with improved filtering options.
+   *
+   * @param params - Parameters for pagination, filtering, and ordering
+   * @returns Promise containing paginated traces and pagination info
+   */
+  listTraces(params: ListTracesArgs = {}): Promise<ListTracesResponse> {
+    return this.observability.listTraces(params);
   }
 
   listScoresBySpan(params: ListScoresBySpanParams): Promise<ListScoresResponse> {
@@ -711,7 +813,7 @@ export class MastraClient extends BaseResource {
     }
 
     const queryString = searchParams.toString();
-    return this.request(`/api/stored/agents${queryString ? `?${queryString}` : ''}`);
+    return this.request(`/stored/agents${queryString ? `?${queryString}` : ''}`);
   }
 
   /**
@@ -720,7 +822,7 @@ export class MastraClient extends BaseResource {
    * @returns Promise containing the created stored agent
    */
   public createStoredAgent(params: CreateStoredAgentParams): Promise<StoredAgentResponse> {
-    return this.request('/api/stored/agents', {
+    return this.request('/stored/agents', {
       method: 'POST',
       body: params,
     });
@@ -744,6 +846,47 @@ export class MastraClient extends BaseResource {
    * @returns Promise containing the list of installed Mastra packages
    */
   public getSystemPackages(): Promise<GetSystemPackagesResponse> {
-    return this.request('/api/system/packages');
+    return this.request('/system/packages');
+  }
+
+  // ============================================================================
+  // Workspace
+  // ============================================================================
+
+  /**
+   * Lists all workspaces from both Mastra instance and agents
+   * @returns Promise containing array of workspace items
+   */
+  public listWorkspaces(): Promise<ListWorkspacesResponse> {
+    return this.request('/workspaces');
+  }
+
+  /**
+   * Gets the workspace resource for filesystem, search, and skills operations
+   * @param workspaceId - Workspace ID to target
+   * @returns Workspace instance
+   */
+  public getWorkspace(workspaceId: string): Workspace {
+    return new Workspace(this.options, workspaceId);
+  }
+
+  // ============================================================================
+  // Vectors & Embedders
+  // ============================================================================
+
+  /**
+   * Lists all available vector stores
+   * @returns Promise containing list of available vector stores
+   */
+  public listVectors(): Promise<ListVectorsResponse> {
+    return this.request('/vectors');
+  }
+
+  /**
+   * Lists all available embedding models
+   * @returns Promise containing list of available embedders
+   */
+  public listEmbedders(): Promise<ListEmbeddersResponse> {
+    return this.request('/embedders');
   }
 }

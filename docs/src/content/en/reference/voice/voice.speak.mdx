@@ -1,6 +1,12 @@
 ---
 title: "Reference: voice.speak() | Voice"
 description: "Documentation for the speak() method available in all Mastra voice providers, which converts text to speech."
+packages:
+  - "@mastra/core"
+  - "@mastra/node-speaker"
+  - "@mastra/voice-openai"
+  - "@mastra/voice-openai-realtime"
+  - "@mastra/voice-playai"
 ---
 
 # voice.speak()
@@ -201,7 +207,7 @@ const audioWithOptions = await voice.speak("Hello with options!", {
 });
 ```
 
-See the [CompositeVoice reference](/reference/v1/voice/composite-voice) for more details on AI SDK integration.
+See the [CompositeVoice reference](/reference/voice/composite-voice) for more details on AI SDK integration.
 
 ## Realtime Voice Providers
 

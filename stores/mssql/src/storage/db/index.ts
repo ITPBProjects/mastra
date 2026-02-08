@@ -1,6 +1,12 @@
 import { MastraBase } from '@mastra/core/base';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
-import { createStorageErrorId, TABLE_WORKFLOW_SNAPSHOT, TABLE_SCHEMAS, getDefaultValue } from '@mastra/core/storage';
+import {
+  createStorageErrorId,
+  TABLE_WORKFLOW_SNAPSHOT,
+  TABLE_SPANS,
+  TABLE_SCHEMAS,
+  getDefaultValue,
+} from '@mastra/core/storage';
 import type {
   StorageColumn,
   TABLE_NAMES,
@@ -107,16 +113,57 @@ export class MssqlDB extends MastraBase {
   private setupSchemaPromise: Promise<void> | null = null;
   private schemaSetupComplete: boolean | undefined = undefined;
 
-  protected getSqlType(type: StorageColumn['type'], isPrimaryKey = false, useLargeStorage = false): string {
+  /**
+   * Columns that participate in composite indexes need smaller sizes (NVARCHAR(100)).
+   * MSSQL has a 900-byte index key limit, so composite indexes with NVARCHAR(400) columns fail.
+   * These are typically ID/type fields that don't need 400 chars.
+   */
+  private readonly COMPOSITE_INDEX_COLUMNS = [
+    'traceId', // Used in: PRIMARY KEY (traceId, spanId), index (traceId, spanId, seq_id)
+    'spanId', // Used in: PRIMARY KEY (traceId, spanId), index (traceId, spanId, seq_id)
+    'parentSpanId', // Used in: index (parentSpanId, startedAt)
+    'entityType', // Used in: (entityType, entityId), (entityType, entityName)
+    'entityId', // Used in: (entityType, entityId)
+    'entityName', // Used in: (entityType, entityName)
+    'organizationId', // Used in: (organizationId, userId)
+    'userId', // Used in: (organizationId, userId)
+  ];
+
+  /**
+   * Columns that store large amounts of data and should use NVARCHAR(MAX).
+   * Avoid listing columns that participate in indexes (resourceId, thread_id, agent_name, name, etc.)
+   */
+  private readonly LARGE_DATA_COLUMNS = [
+    'workingMemory',
+    'snapshot',
+    'metadata',
+    'content', // messages.content - can be very long conversation content
+    'input', // evals.input - test input data
+    'output', // evals.output - test output data
+    'instructions', // evals.instructions - evaluation instructions
+    'other', // traces.other - additional trace data
+  ];
+
+  protected getSqlType(
+    type: StorageColumn['type'],
+    isPrimaryKey = false,
+    useLargeStorage = false,
+    useSmallStorage = false,
+  ): string {
     switch (type) {
       case 'text':
         // Use NVARCHAR(MAX) for columns that store large amounts of data (workingMemory, snapshot, metadata)
         if (useLargeStorage) {
           return 'NVARCHAR(MAX)';
         }
-        // Use NVARCHAR(400) for regular columns to enable composite indexing
-        // MSSQL has a 900-byte index key limit
-        // NVARCHAR(400) = 800 bytes, leaving 100 bytes for other columns in composite indexes
+        // Use NVARCHAR(100) for columns that participate in composite indexes
+        // MSSQL has a 900-byte index key limit, NVARCHAR(100) = 200 bytes
+        // This allows up to 4 columns in a composite index (4 * 200 = 800 bytes < 900)
+        if (useSmallStorage) {
+          return 'NVARCHAR(100)';
+        }
+        // Use NVARCHAR(400) for regular columns to enable single-column indexing
+        // MSSQL has a 900-byte index key limit, NVARCHAR(400) = 800 bytes
         // Primary keys use NVARCHAR(255) for consistency with common UUID/ID lengths
         return isPrimaryKey ? 'NVARCHAR(255)' : 'NVARCHAR(400)';
       case 'timestamp':
@@ -310,19 +357,6 @@ export class MssqlDB extends MastraBase {
     try {
       const uniqueConstraintColumns = tableName === TABLE_WORKFLOW_SNAPSHOT ? ['workflow_name', 'run_id'] : [];
 
-      // Columns that store large amounts of data and should use NVARCHAR(MAX)
-      // Avoid listing columns that participate in indexes (resourceId, thread_id, agent_name, name, etc.)
-      const largeDataColumns = [
-        'workingMemory',
-        'snapshot',
-        'metadata',
-        'content', // messages.content - can be very long conversation content
-        'input', // evals.input - test input data
-        'output', // evals.output - test output data
-        'instructions', // evals.instructions - evaluation instructions
-        'other', // traces.other - additional trace data
-      ];
-
       const columns = Object.entries(schema)
         .map(([name, def]) => {
           const parsedName = parseSqlIdentifier(name, 'column name');
@@ -330,8 +364,9 @@ export class MssqlDB extends MastraBase {
           if (def.primaryKey) constraints.push('PRIMARY KEY');
           if (!def.nullable) constraints.push('NOT NULL');
           const isIndexed = !!def.primaryKey || uniqueConstraintColumns.includes(name);
-          const useLargeStorage = largeDataColumns.includes(name);
-          return `[${parsedName}] ${this.getSqlType(def.type, isIndexed, useLargeStorage)} ${constraints.join(' ')}`.trim();
+          const useLargeStorage = this.LARGE_DATA_COLUMNS.includes(name);
+          const useSmallStorage = this.COMPOSITE_INDEX_COLUMNS.includes(name);
+          return `[${parsedName}] ${this.getSqlType(def.type, isIndexed, useLargeStorage, useSmallStorage)} ${constraints.join(' ')}`.trim();
         })
         .join(',\n');
 
@@ -379,19 +414,86 @@ export class MssqlDB extends MastraBase {
         await this.pool.request().query(alterSql);
       }
 
+      // Use schema prefix for constraint names to avoid collisions across schemas
+      const schemaPrefix = this.schemaName ? `${this.schemaName}_` : '';
+
       if (tableName === TABLE_WORKFLOW_SNAPSHOT) {
-        const constraintName = 'mastra_workflow_snapshot_workflow_name_run_id_key';
+        const constraintName = `${schemaPrefix}mastra_workflow_snapshot_workflow_name_run_id_key`;
         const checkConstraintSql = `SELECT 1 AS found FROM sys.key_constraints WHERE name = @constraintName`;
         const checkConstraintRequest = this.pool.request();
         checkConstraintRequest.input('constraintName', constraintName);
         const constraintResult = await checkConstraintRequest.query(checkConstraintSql);
         const constraintExists = Array.isArray(constraintResult.recordset) && constraintResult.recordset.length > 0;
         if (!constraintExists) {
-          const addConstraintSql = `ALTER TABLE ${getTableName({ indexName: tableName, schemaName: getSchemaName(this.schemaName) })} ADD CONSTRAINT ${constraintName} UNIQUE ([workflow_name], [run_id])`;
+          const addConstraintSql = `ALTER TABLE ${getTableName({ indexName: tableName, schemaName: getSchemaName(this.schemaName) })} ADD CONSTRAINT [${constraintName}] UNIQUE ([workflow_name], [run_id])`;
           await this.pool.request().query(addConstraintSql);
         }
       }
+
+      // Run migrations and add composite primary key for Spans table
+      if (tableName === TABLE_SPANS) {
+        await this.migrateSpansTable();
+
+        // Check if PRIMARY KEY constraint already exists - if so, skip migration
+        // This avoids running expensive queries on every init after migration is complete
+        const pkConstraintName = `${schemaPrefix}mastra_ai_spans_traceid_spanid_pk`;
+        const checkPkRequest = this.pool.request();
+        checkPkRequest.input('constraintName', pkConstraintName);
+        const pkResult = await checkPkRequest.query(
+          `SELECT 1 AS found FROM sys.key_constraints WHERE name = @constraintName`,
+        );
+        const pkExists = Array.isArray(pkResult.recordset) && pkResult.recordset.length > 0;
+
+        if (!pkExists) {
+          // Check for duplicates before attempting to add PRIMARY KEY
+          const duplicateInfo = await this.checkForDuplicateSpans();
+          if (duplicateInfo.hasDuplicates) {
+            // Duplicates exist - throw error requiring manual migration
+            const errorMessage =
+              `\n` +
+              `===========================================================================\n` +
+              `MIGRATION REQUIRED: Duplicate spans detected in ${duplicateInfo.tableName}\n` +
+              `===========================================================================\n` +
+              `\n` +
+              `Found ${duplicateInfo.duplicateCount} duplicate (traceId, spanId) combinations.\n` +
+              `\n` +
+              `The spans table requires a unique constraint on (traceId, spanId), but your\n` +
+              `database contains duplicate entries that must be resolved first.\n` +
+              `\n` +
+              `To fix this, run the manual migration command:\n` +
+              `\n` +
+              `  npx mastra migrate\n` +
+              `\n` +
+              `This command will:\n` +
+              `  1. Remove duplicate spans (keeping the most complete/recent version)\n` +
+              `  2. Add the required unique constraint\n` +
+              `\n` +
+              `Note: This migration may take some time for large tables.\n` +
+              `===========================================================================\n`;
+
+            throw new MastraError({
+              id: createStorageErrorId('MSSQL', 'MIGRATION_REQUIRED', 'DUPLICATE_SPANS'),
+              domain: ErrorDomain.STORAGE,
+              category: ErrorCategory.USER,
+              text: errorMessage,
+            });
+          } else {
+            // No duplicates - safe to add PRIMARY KEY directly
+            try {
+              const addPkSql = `ALTER TABLE ${getTableName({ indexName: tableName, schemaName: getSchemaName(this.schemaName) })} ADD CONSTRAINT [${pkConstraintName}] PRIMARY KEY ([traceId], [spanId])`;
+              await this.pool.request().query(addPkSql);
+            } catch (pkError) {
+              // Log warning but don't fail - existing tables might have data issues
+              this.logger?.warn?.(`Failed to add composite primary key to spans table:`, pkError);
+            }
+          }
+        }
+      }
     } catch (error) {
+      // Rethrow MastraError (especially for migration required errors) - these must stop init
+      if (error instanceof MastraError) {
+        throw error;
+      }
       throw new MastraError(
         {
           id: createStorageErrorId('MSSQL', 'CREATE_TABLE', 'FAILED'),
@@ -404,6 +506,239 @@ export class MssqlDB extends MastraBase {
         error,
       );
     }
+  }
+
+  /**
+   * Migrates the spans table schema from OLD_SPAN_SCHEMA to current SPAN_SCHEMA.
+   * This adds new columns that don't exist in old schema.
+   */
+  private async migrateSpansTable(): Promise<void> {
+    const fullTableName = getTableName({ indexName: TABLE_SPANS, schemaName: getSchemaName(this.schemaName) });
+    const schema = TABLE_SCHEMAS[TABLE_SPANS];
+
+    try {
+      // Add any columns from current schema that don't exist in the database
+      for (const [columnName, columnDef] of Object.entries(schema)) {
+        const columnExists = await this.hasColumn(TABLE_SPANS, columnName);
+        if (!columnExists) {
+          const parsedColumnName = parseSqlIdentifier(columnName, 'column name');
+          const useLargeStorage = this.LARGE_DATA_COLUMNS.includes(columnName);
+          const useSmallStorage = this.COMPOSITE_INDEX_COLUMNS.includes(columnName);
+          const isIndexed = !!columnDef.primaryKey;
+          const sqlType = this.getSqlType(columnDef.type, isIndexed, useLargeStorage, useSmallStorage);
+          // Align with createTable: nullable columns omit NOT NULL, non-nullable columns include it
+          const nullable = columnDef.nullable ? '' : 'NOT NULL';
+          const defaultValue = !columnDef.nullable ? this.getDefaultValue(columnDef.type) : '';
+          const alterSql =
+            `ALTER TABLE ${fullTableName} ADD [${parsedColumnName}] ${sqlType} ${nullable} ${defaultValue}`.trim();
+          await this.pool.request().query(alterSql);
+          this.logger?.debug?.(`Added column '${columnName}' to ${fullTableName}`);
+        }
+      }
+
+      this.logger?.info?.(`Migration completed for ${fullTableName}`);
+    } catch (error) {
+      // Log warning but don't fail - migrations should be best-effort
+      this.logger?.warn?.(`Failed to migrate spans table ${fullTableName}:`, error);
+    }
+  }
+
+  /**
+   * Deduplicates spans with the same (traceId, spanId) combination.
+   * This is needed for databases that existed before the unique constraint was added.
+   *
+   * Priority for keeping spans:
+   * 1. Completed spans (endedAt IS NOT NULL) over incomplete spans
+   * 2. Most recent updatedAt
+   * 3. Most recent createdAt (as tiebreaker)
+   *
+   * Note: This prioritizes migration completion over perfect data preservation.
+   * Old trace data may be lost, which is acceptable for this use case.
+   */
+  private async deduplicateSpans(): Promise<void> {
+    const fullTableName = getTableName({ indexName: TABLE_SPANS, schemaName: getSchemaName(this.schemaName) });
+
+    try {
+      // Quick check: are there any duplicates at all? Use TOP 1 for speed on large tables.
+      const duplicateCheck = await this.pool.request().query(`
+        SELECT TOP 1 1 as has_duplicates
+        FROM ${fullTableName}
+        GROUP BY [traceId], [spanId]
+        HAVING COUNT(*) > 1
+      `);
+
+      if (!duplicateCheck.recordset || duplicateCheck.recordset.length === 0) {
+        this.logger?.debug?.(`No duplicate spans found in ${fullTableName}`);
+        return;
+      }
+
+      this.logger?.info?.(`Duplicate spans detected in ${fullTableName}, starting deduplication...`);
+
+      // Delete duplicates directly without fetching details into memory.
+      // This avoids OOM issues on large tables with many duplicates.
+      // Uses ROW_NUMBER partitioned by (traceId, spanId) to identify duplicates across ALL rows.
+      // Priority: completed spans (endedAt NOT NULL) > most recent updatedAt > most recent createdAt
+      const result = await this.pool.request().query(`
+        WITH RankedSpans AS (
+          SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY [traceId], [spanId]
+            ORDER BY
+              CASE WHEN [endedAt] IS NOT NULL THEN 0 ELSE 1 END,
+              [updatedAt] DESC,
+              [createdAt] DESC
+          ) as rn
+          FROM ${fullTableName}
+        )
+        DELETE FROM RankedSpans WHERE rn > 1
+      `);
+
+      this.logger?.info?.(
+        `Deduplication complete: removed ${result.rowsAffected?.[0] ?? 0} duplicate spans from ${fullTableName}`,
+      );
+    } catch (error) {
+      this.logger?.warn?.('Failed to deduplicate spans:', error);
+      // Don't throw - deduplication is best-effort to allow migration to continue
+    }
+  }
+
+  /**
+   * Checks for duplicate (traceId, spanId) combinations in the spans table.
+   * Returns information about duplicates for logging/CLI purposes.
+   */
+  private async checkForDuplicateSpans(): Promise<{
+    hasDuplicates: boolean;
+    duplicateCount: number;
+    tableName: string;
+  }> {
+    const fullTableName = getTableName({ indexName: TABLE_SPANS, schemaName: getSchemaName(this.schemaName) });
+
+    try {
+      // Count duplicate (traceId, spanId) combinations
+      const result = await this.pool.request().query(`
+        SELECT COUNT(*) as duplicate_count
+        FROM (
+          SELECT [traceId], [spanId]
+          FROM ${fullTableName}
+          GROUP BY [traceId], [spanId]
+          HAVING COUNT(*) > 1
+        ) duplicates
+      `);
+
+      const duplicateCount = result.recordset?.[0]?.duplicate_count ?? 0;
+      return {
+        hasDuplicates: duplicateCount > 0,
+        duplicateCount,
+        tableName: fullTableName,
+      };
+    } catch (error) {
+      // If table doesn't exist or other error, assume no duplicates
+      this.logger?.debug?.(`Could not check for duplicates: ${error}`);
+      return { hasDuplicates: false, duplicateCount: 0, tableName: fullTableName };
+    }
+  }
+
+  /**
+   * Checks if the PRIMARY KEY constraint on (traceId, spanId) already exists on the spans table.
+   */
+  private async spansPrimaryKeyExists(): Promise<boolean> {
+    const schemaPrefix = this.schemaName ? `${parseSqlIdentifier(this.schemaName, 'schema name')}_` : '';
+    const pkConstraintName = `${schemaPrefix}mastra_ai_spans_traceid_spanid_pk`;
+
+    const checkPkRequest = this.pool.request();
+    checkPkRequest.input('constraintName', pkConstraintName);
+    const pkResult = await checkPkRequest.query(
+      `SELECT 1 AS found FROM sys.key_constraints WHERE name = @constraintName`,
+    );
+    return Array.isArray(pkResult.recordset) && pkResult.recordset.length > 0;
+  }
+
+  /**
+   * Manually run the spans migration to deduplicate and add the unique constraint.
+   * This is intended to be called from the CLI when duplicates are detected.
+   *
+   * @returns Migration result with status and details
+   */
+  async migrateSpans(): Promise<{
+    success: boolean;
+    alreadyMigrated: boolean;
+    duplicatesRemoved: number;
+    message: string;
+  }> {
+    const fullTableName = getTableName({ indexName: TABLE_SPANS, schemaName: getSchemaName(this.schemaName) });
+
+    // Check if already migrated
+    const pkExists = await this.spansPrimaryKeyExists();
+    if (pkExists) {
+      return {
+        success: true,
+        alreadyMigrated: true,
+        duplicatesRemoved: 0,
+        message: `Migration already complete. PRIMARY KEY constraint exists on ${fullTableName}.`,
+      };
+    }
+
+    // Check for duplicates
+    const duplicateInfo = await this.checkForDuplicateSpans();
+
+    if (duplicateInfo.hasDuplicates) {
+      this.logger?.info?.(
+        `Found ${duplicateInfo.duplicateCount} duplicate (traceId, spanId) combinations. Starting deduplication...`,
+      );
+
+      // Run deduplication
+      await this.deduplicateSpans();
+    } else {
+      this.logger?.info?.(`No duplicate spans found.`);
+    }
+
+    // Add PRIMARY KEY constraint
+    const schemaPrefix = this.schemaName ? `${parseSqlIdentifier(this.schemaName, 'schema name')}_` : '';
+    const pkConstraintName = `${schemaPrefix}mastra_ai_spans_traceid_spanid_pk`;
+    const addPkSql = `ALTER TABLE ${fullTableName} ADD CONSTRAINT [${pkConstraintName}] PRIMARY KEY ([traceId], [spanId])`;
+    await this.pool.request().query(addPkSql);
+
+    return {
+      success: true,
+      alreadyMigrated: false,
+      duplicatesRemoved: duplicateInfo.duplicateCount,
+      message: duplicateInfo.hasDuplicates
+        ? `Migration complete. Removed duplicates and added PRIMARY KEY constraint to ${fullTableName}.`
+        : `Migration complete. Added PRIMARY KEY constraint to ${fullTableName}.`,
+    };
+  }
+
+  /**
+   * Check migration status for the spans table.
+   * Returns information about whether migration is needed.
+   */
+  async checkSpansMigrationStatus(): Promise<{
+    needsMigration: boolean;
+    hasDuplicates: boolean;
+    duplicateCount: number;
+    constraintExists: boolean;
+    tableName: string;
+  }> {
+    const fullTableName = getTableName({ indexName: TABLE_SPANS, schemaName: getSchemaName(this.schemaName) });
+    const pkExists = await this.spansPrimaryKeyExists();
+
+    if (pkExists) {
+      return {
+        needsMigration: false,
+        hasDuplicates: false,
+        duplicateCount: 0,
+        constraintExists: true,
+        tableName: fullTableName,
+      };
+    }
+
+    const duplicateInfo = await this.checkForDuplicateSpans();
+    return {
+      needsMigration: true,
+      hasDuplicates: duplicateInfo.hasDuplicates,
+      duplicateCount: duplicateInfo.duplicateCount,
+      constraintExists: false,
+      tableName: fullTableName,
+    };
   }
 
   /**
@@ -434,22 +769,13 @@ export class MssqlDB extends MastraBase {
           const columnExists = Array.isArray(checkResult.recordset) && checkResult.recordset.length > 0;
           if (!columnExists) {
             const columnDef = schema[columnName];
-            // Apply the same large data column logic as createTable
-            const largeDataColumns = [
-              'workingMemory',
-              'snapshot',
-              'metadata',
-              'content',
-              'input',
-              'output',
-              'instructions',
-              'other',
-            ];
-            const useLargeStorage = largeDataColumns.includes(columnName);
+            const useLargeStorage = this.LARGE_DATA_COLUMNS.includes(columnName);
+            const useSmallStorage = this.COMPOSITE_INDEX_COLUMNS.includes(columnName);
             const isIndexed = !!columnDef.primaryKey;
-            const sqlType = this.getSqlType(columnDef.type, isIndexed, useLargeStorage);
-            const nullable = columnDef.nullable === false ? 'NOT NULL' : '';
-            const defaultValue = columnDef.nullable === false ? this.getDefaultValue(columnDef.type) : '';
+            const sqlType = this.getSqlType(columnDef.type, isIndexed, useLargeStorage, useSmallStorage);
+            // Align with createTable: nullable columns omit NOT NULL, non-nullable columns include it
+            const nullable = columnDef.nullable ? '' : 'NOT NULL';
+            const defaultValue = !columnDef.nullable ? this.getDefaultValue(columnDef.type) : '';
             const parsedColumnName = parseSqlIdentifier(columnName, 'column name');
             const alterSql =
               `ALTER TABLE ${fullTableName} ADD [${parsedColumnName}] ${sqlType} ${nullable} ${defaultValue}`.trim();

@@ -1,7 +1,7 @@
 import type { ToolSet } from '@internal/ai-sdk-v5';
+import { zodToJsonSchema } from '@mastra/schema-compat/zod-to-json';
 import z from 'zod';
 import type { MastraDBMessage } from '../../../memory';
-import type { OutputSchema } from '../../../stream/base/schema';
 import { ChunkFrom } from '../../../stream/types';
 import type { MastraToolInvocationOptions } from '../../../tools/types';
 import type { SuspendOptions } from '../../../workflows';
@@ -13,7 +13,8 @@ type AddToolMetadataOptions = {
   toolCallId: string;
   toolName: string;
   args: unknown;
-  resumeSchema: z.ZodType<any>;
+  resumeSchema: string;
+  suspendedToolRunId?: string;
 } & (
   | {
       type: 'approval';
@@ -25,10 +26,7 @@ type AddToolMetadataOptions = {
     }
 );
 
-export function createToolCallStep<
-  Tools extends ToolSet = ToolSet,
-  OUTPUT extends OutputSchema | undefined = undefined,
->({
+export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = undefined>({
   tools,
   messageList,
   options,
@@ -38,6 +36,7 @@ export function createToolCallStep<
   streamState,
   modelSpanTracker,
   _internal,
+  logger,
 }: OuterLLMRun<Tools, OUTPUT>) {
   return createStep({
     id: 'toolCallStep',
@@ -60,6 +59,7 @@ export function createToolCallStep<
         suspendPayload,
         resumeSchema,
         type,
+        suspendedToolRunId,
       }: AddToolMetadataOptions) => {
         const metadataKey = type === 'suspension' ? 'suspendedTools' : 'pendingToolApprovals';
         // Find the last assistant message in the response (which should contain this tool call)
@@ -81,7 +81,7 @@ export function createToolCallStep<
             toolName,
             args,
             type,
-            runId, // Store the runId so we can resume after page refresh
+            runId: suspendedToolRunId ?? runId, // Store the runId so we can resume after page refresh
             ...(type === 'suspension' ? { suspendPayload } : {}),
             resumeSchema,
           };
@@ -114,15 +114,58 @@ export function createToolCallStep<
         const lastAssistantMessage = [...allMessages].reverse().find(msg => {
           const metadata = getMetadata(msg);
           const suspendedTools = metadata?.[metadataKey] as Record<string, any> | undefined;
-          return !!suspendedTools?.[toolName];
+          const foundTool = !!suspendedTools?.[toolName];
+          if (foundTool) {
+            return true;
+          }
+          const dataToolSuspendedParts = msg.content.parts?.filter(
+            part => part.type === 'data-tool-call-suspended' || part.type === 'data-tool-call-approval',
+          );
+          if (dataToolSuspendedParts && dataToolSuspendedParts.length > 0) {
+            const foundTool = dataToolSuspendedParts.find((part: any) => part.data.toolName === toolName);
+            if (foundTool) {
+              return true;
+            }
+          }
+          return false;
         });
 
         if (lastAssistantMessage) {
           const metadata = getMetadata(lastAssistantMessage);
-          const suspendedTools = metadata?.[metadataKey] as Record<string, any> | undefined;
+          let suspendedTools = metadata?.[metadataKey] as Record<string, any> | undefined;
+          if (!suspendedTools) {
+            suspendedTools = lastAssistantMessage.content.parts
+              ?.filter(part => part.type === 'data-tool-call-suspended' || part.type === 'data-tool-call-approval')
+              ?.reduce(
+                (acc, part) => {
+                  if (part.type === 'data-tool-call-suspended' || part.type === 'data-tool-call-approval') {
+                    acc[(part.data as any).toolName] = part.data;
+                  }
+                  return acc;
+                },
+                {} as Record<string, any>,
+              );
+          }
 
           if (suspendedTools && typeof suspendedTools === 'object') {
-            delete suspendedTools[toolName];
+            if (metadata) {
+              delete suspendedTools[toolName];
+            } else {
+              lastAssistantMessage.content.parts = lastAssistantMessage.content.parts?.map(part => {
+                if (part.type === 'data-tool-call-suspended' || part.type === 'data-tool-call-approval') {
+                  if ((part.data as any).toolName === toolName) {
+                    return {
+                      ...part,
+                      data: {
+                        ...(part.data as any),
+                        resumed: true,
+                      },
+                    };
+                  }
+                }
+                return part;
+              });
+            }
 
             // If no more pending suspensions, remove the whole object
             if (metadata && Object.keys(suspendedTools).length === 0) {
@@ -133,7 +176,7 @@ export function createToolCallStep<
             try {
               await saveQueueManager.flushMessages(messageList, threadId, memoryConfig);
             } catch (error) {
-              console.error('Error removing tool suspension metadata:', error);
+              logger?.error('Error removing tool suspension metadata:', error);
             }
           }
         }
@@ -165,7 +208,7 @@ export function createToolCallStep<
           // Flush all pending messages immediately
           await saveQueueManager.flushMessages(messageList, threadId, memoryConfig);
         } catch (error) {
-          console.error('Error flushing messages before suspension:', error);
+          logger?.error('Error flushing messages before suspension:', error);
         }
       };
 
@@ -190,7 +233,7 @@ export function createToolCallStep<
             abortSignal: options?.abortSignal,
           });
         } catch (error) {
-          console.error('Error calling onInputAvailable', error);
+          logger?.error('Error calling onInputAvailable', error);
         }
       }
 
@@ -214,7 +257,26 @@ export function createToolCallStep<
 
         const isResumeToolCall = !!resumeDataFromArgs;
 
-        if (requireToolApproval || (tool as any).requireApproval) {
+        // Check if approval is required
+        // requireApproval can be:
+        // - boolean (from Mastra createTool or mapped from AI SDK needsApproval: true)
+        // - undefined (no approval needed)
+        // If needsApprovalFn exists, evaluate it with the tool args
+        let toolRequiresApproval = requireToolApproval || (tool as any).requireApproval;
+        if ((tool as any).needsApprovalFn) {
+          // Evaluate the function with the parsed args
+          try {
+            const needsApprovalResult = await (tool as any).needsApprovalFn(args);
+            toolRequiresApproval = needsApprovalResult;
+          } catch (error) {
+            // Log error to help developers debug faulty needsApprovalFn implementations
+            logger?.error(`Error evaluating needsApprovalFn for tool ${inputData.toolName}:`, error);
+            // On error, default to requiring approval to be safe
+            toolRequiresApproval = true;
+          }
+        }
+
+        if (toolRequiresApproval) {
           if (!resumeData) {
             controller.enqueue({
               type: 'tool-call-approval',
@@ -224,6 +286,17 @@ export function createToolCallStep<
                 toolCallId: inputData.toolCallId,
                 toolName: inputData.toolName,
                 args: inputData.args,
+                resumeSchema: JSON.stringify(
+                  zodToJsonSchema(
+                    z.object({
+                      approved: z
+                        .boolean()
+                        .describe(
+                          'Controls if the tool call is approved or not, should be true when approved and false when declined',
+                        ),
+                    }),
+                  ),
+                ),
               },
             });
 
@@ -233,13 +306,17 @@ export function createToolCallStep<
               toolName: inputData.toolName,
               args: inputData.args,
               type: 'approval',
-              resumeSchema: z.object({
-                approved: z
-                  .boolean()
-                  .describe(
-                    'Controls if the tool call is approved or not, should be true when approved and false when declined',
-                  ),
-              }),
+              resumeSchema: JSON.stringify(
+                zodToJsonSchema(
+                  z.object({
+                    approved: z
+                      .boolean()
+                      .describe(
+                        'Controls if the tool call is approved or not, should be true when approved and false when declined',
+                      ),
+                  }),
+                ),
+              ),
             });
 
             // Flush messages before suspension to ensure they are persisted
@@ -273,6 +350,12 @@ export function createToolCallStep<
           await removeToolMetadata(inputData.toolName, 'suspension');
         }
 
+        //this is to avoid passing resume data to the tool if it's not needed
+        const resumeDataToPassToToolOptions =
+          toolRequiresApproval && Object.keys(resumeData).length === 1 && 'approved' in resumeData
+            ? undefined
+            : resumeData;
+
         const toolOptions: MastraToolInvocationOptions = {
           abortSignal: options?.abortSignal,
           toolCallId: inputData.toolCallId,
@@ -281,45 +364,141 @@ export function createToolCallStep<
           // Pass current step span as parent for tool call spans
           tracingContext: modelSpanTracker?.getTracingContext(),
           suspend: async (suspendPayload: any, options?: SuspendOptions) => {
-            controller.enqueue({
-              type: 'tool-call-suspended',
-              runId,
-              from: ChunkFrom.AGENT,
-              payload: {
+            if (options?.requireToolApproval) {
+              controller.enqueue({
+                type: 'tool-call-approval',
+                runId,
+                from: ChunkFrom.AGENT,
+                payload: {
+                  toolCallId: inputData.toolCallId,
+                  toolName: inputData.toolName,
+                  args: inputData.args,
+                  resumeSchema: JSON.stringify(
+                    zodToJsonSchema(
+                      z.object({
+                        approved: z
+                          .boolean()
+                          .describe(
+                            'Controls if the tool call is approved or not, should be true when approved and false when declined',
+                          ),
+                      }),
+                    ),
+                  ),
+                },
+              });
+
+              // Add approval metadata to message before persisting
+              addToolMetadata({
                 toolCallId: inputData.toolCallId,
                 toolName: inputData.toolName,
-                suspendPayload,
                 args: inputData.args,
-              },
-            });
+                type: 'approval',
+                suspendedToolRunId: options.runId,
+                resumeSchema: JSON.stringify(
+                  zodToJsonSchema(
+                    z.object({
+                      approved: z
+                        .boolean()
+                        .describe(
+                          'Controls if the tool call is approved or not, should be true when approved and false when declined',
+                        ),
+                    }),
+                  ),
+                ),
+              });
 
-            // Add suspension metadata to message before persisting
-            addToolMetadata({
-              toolCallId: inputData.toolCallId,
-              toolName: inputData.toolName,
-              args,
-              suspendPayload,
-              type: 'suspension',
-              resumeSchema: options?.resumeSchema,
-            });
+              // Flush messages before suspension to ensure they are persisted
+              await flushMessagesBeforeSuspension();
 
-            // Flush messages before suspension to ensure they are persisted
-            await flushMessagesBeforeSuspension();
+              return suspend(
+                {
+                  requireToolApproval: {
+                    toolCallId: inputData.toolCallId,
+                    toolName: inputData.toolName,
+                    args: inputData.args,
+                  },
+                  __streamState: streamState.serialize(),
+                },
+                {
+                  resumeLabel: inputData.toolCallId,
+                },
+              );
+            } else {
+              controller.enqueue({
+                type: 'tool-call-suspended',
+                runId,
+                from: ChunkFrom.AGENT,
+                payload: {
+                  toolCallId: inputData.toolCallId,
+                  toolName: inputData.toolName,
+                  suspendPayload,
+                  args: inputData.args,
+                  resumeSchema: options?.resumeSchema,
+                },
+              });
 
-            return await suspend(
-              {
-                toolCallSuspended: suspendPayload,
-                __streamState: streamState.serialize(),
+              // Add suspension metadata to message before persisting
+              addToolMetadata({
+                toolCallId: inputData.toolCallId,
                 toolName: inputData.toolName,
-                resumeLabel: options?.resumeLabel,
-              },
-              {
-                resumeLabel: inputData.toolCallId,
-              },
-            );
+                args,
+                suspendPayload,
+                suspendedToolRunId: options?.isAgentSuspend ? options.runId : undefined,
+                type: 'suspension',
+                resumeSchema: options?.resumeSchema,
+              });
+
+              // Flush messages before suspension to ensure they are persisted
+              await flushMessagesBeforeSuspension();
+
+              return await suspend(
+                {
+                  toolCallSuspended: suspendPayload,
+                  __streamState: streamState.serialize(),
+                  toolName: inputData.toolName,
+                  resumeLabel: options?.resumeLabel,
+                },
+                {
+                  resumeLabel: inputData.toolCallId,
+                },
+              );
+            }
           },
-          resumeData,
+          resumeData: resumeDataToPassToToolOptions,
         };
+
+        //if resuming a subAgent tool, we want to find the runId from when the subAgent got suspended.
+        if (resumeDataToPassToToolOptions && inputData.toolName?.startsWith('agent-') && !isResumeToolCall) {
+          let suspendedToolRunId = '';
+          const messages = messageList.get.all.db();
+          const assistantMessages = [...messages].reverse().filter(message => message.role === 'assistant');
+
+          for (const message of assistantMessages) {
+            const pendingOrSuspendedTools = (message.content.metadata?.suspendedTools ||
+              message.content.metadata?.pendingToolApprovals) as Record<string, any>;
+            if (pendingOrSuspendedTools && pendingOrSuspendedTools[inputData.toolName]) {
+              suspendedToolRunId = pendingOrSuspendedTools[inputData.toolName].runId;
+              break;
+            }
+
+            const dataToolSuspendedParts = message.content.parts?.filter(
+              part =>
+                (part.type === 'data-tool-call-suspended' || part.type === 'data-tool-call-approval') &&
+                !(part.data as any).resumed,
+            );
+            if (dataToolSuspendedParts && dataToolSuspendedParts.length > 0) {
+              const foundTool = dataToolSuspendedParts.find((part: any) => part.data.toolName === inputData.toolName);
+              if (foundTool) {
+                suspendedToolRunId = (foundTool as any).data.runId;
+                break;
+              }
+            }
+          }
+
+          if (suspendedToolRunId) {
+            args.suspendedToolRunId = suspendedToolRunId;
+          }
+        }
 
         const result = await tool.execute(args, toolOptions);
 
@@ -333,7 +512,7 @@ export function createToolCallStep<
               abortSignal: options?.abortSignal,
             });
           } catch (error) {
-            console.error('Error calling onOutput', error);
+            logger?.error('Error calling onOutput', error);
           }
         }
 

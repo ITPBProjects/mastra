@@ -1,5 +1,5 @@
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
-import type { SaveScorePayload, ScoreRowData, ScoringSource, ValidatedSaveScorePayload } from '@mastra/core/evals';
+import type { ListScoresResponse, SaveScorePayload, ScoreRowData, ScoringSource } from '@mastra/core/evals';
 import { saveScorePayloadSchema } from '@mastra/core/evals';
 import {
   createStorageErrorId,
@@ -9,17 +9,23 @@ import {
   normalizePerPage,
   TABLE_SCORERS,
 } from '@mastra/core/storage';
-import type { PaginationInfo, StoragePagination } from '@mastra/core/storage';
+import type { StoragePagination } from '@mastra/core/storage';
 import type { Service } from 'electrodb';
 import { resolveDynamoDBConfig } from '../../db';
 import type { DynamoDBDomainConfig } from '../../db';
+import type { DynamoDBTtlConfig } from '../../index';
+import { getTtlProps } from '../../ttl';
 import { deleteTableData } from '../utils';
 
 export class ScoresStorageDynamoDB extends ScoresStorage {
   private service: Service<Record<string, any>>;
+  private ttlConfig?: DynamoDBTtlConfig;
+
   constructor(config: DynamoDBDomainConfig) {
     super();
-    this.service = resolveDynamoDBConfig(config);
+    const resolved = resolveDynamoDBConfig(config);
+    this.service = resolved.service;
+    this.ttlConfig = resolved.ttl;
   }
 
   async dangerouslyClearAll(): Promise<void> {
@@ -80,7 +86,7 @@ export class ScoresStorageDynamoDB extends ScoresStorage {
   }
 
   async saveScore(score: SaveScorePayload): Promise<{ score: ScoreRowData }> {
-    let validatedScore: ValidatedSaveScorePayload;
+    let validatedScore: SaveScorePayload;
     try {
       validatedScore = saveScorePayloadSchema.parse(score);
     } catch (error) {
@@ -90,7 +96,7 @@ export class ScoresStorageDynamoDB extends ScoresStorage {
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.USER,
           details: {
-            scorer: score.scorer?.id ?? 'unknown',
+            scorer: typeof score.scorer?.id === 'string' ? score.scorer.id : String(score.scorer?.id ?? 'unknown'),
             entityId: score.entityId ?? 'unknown',
             entityType: score.entityType ?? 'unknown',
             traceId: score.traceId ?? '',
@@ -124,8 +130,20 @@ export class ScoresStorageDynamoDB extends ScoresStorage {
         : JSON.stringify(validatedScore.requestContext);
     const entity =
       typeof validatedScore.entity === 'string' ? validatedScore.entity : JSON.stringify(validatedScore.entity);
+    const metadata =
+      typeof validatedScore.metadata === 'string'
+        ? validatedScore.metadata
+        : validatedScore.metadata
+          ? JSON.stringify(validatedScore.metadata)
+          : undefined;
+    const additionalContext =
+      typeof validatedScore.additionalContext === 'string'
+        ? validatedScore.additionalContext
+        : validatedScore.additionalContext
+          ? JSON.stringify(validatedScore.additionalContext)
+          : undefined;
 
-    const scoreData = Object.fromEntries(
+    const scoreData: Record<string, any> = Object.fromEntries(
       Object.entries({
         ...validatedScore,
         entity: 'score',
@@ -136,6 +154,8 @@ export class ScoresStorageDynamoDB extends ScoresStorage {
         input,
         output,
         requestContext,
+        metadata,
+        additionalContext,
         entityData: entity,
         traceId: validatedScore.traceId || '',
         resourceId: validatedScore.resourceId || '',
@@ -143,6 +163,7 @@ export class ScoresStorageDynamoDB extends ScoresStorage {
         spanId: validatedScore.spanId || '',
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
+        ...getTtlProps('score', this.ttlConfig),
       }).filter(([_, value]) => value !== undefined && value !== null),
     );
 
@@ -182,7 +203,7 @@ export class ScoresStorageDynamoDB extends ScoresStorage {
     entityId?: string;
     entityType?: string;
     source?: ScoringSource;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
+  }): Promise<ListScoresResponse> {
     try {
       // Query scores by scorer ID using the GSI
       const query = this.service.entities.score.query.byScorer({ entity: 'score', scorerId });
@@ -249,7 +270,7 @@ export class ScoresStorageDynamoDB extends ScoresStorage {
   }: {
     runId: string;
     pagination: StoragePagination;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
+  }): Promise<ListScoresResponse> {
     this.logger.debug('Getting scores by run ID', { runId, pagination });
 
     try {
@@ -302,7 +323,7 @@ export class ScoresStorageDynamoDB extends ScoresStorage {
     entityId: string;
     entityType: string;
     pagination: StoragePagination;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
+  }): Promise<ListScoresResponse> {
     this.logger.debug('Getting scores by entity ID', { entityId, entityType, pagination });
 
     try {
@@ -358,7 +379,7 @@ export class ScoresStorageDynamoDB extends ScoresStorage {
     traceId: string;
     spanId: string;
     pagination: StoragePagination;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
+  }): Promise<ListScoresResponse> {
     this.logger.debug('Getting scores by span', { traceId, spanId, pagination });
 
     try {

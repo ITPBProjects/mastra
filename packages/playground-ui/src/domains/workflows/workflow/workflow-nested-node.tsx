@@ -4,8 +4,7 @@ import { CircleDashed, HourglassIcon, Loader2, PauseIcon, ShieldAlert } from 'lu
 import { SerializedStepFlowEntry } from '@mastra/core/workflows';
 
 import { cn } from '@/lib/utils';
-import { useContext } from 'react';
-import { WorkflowNestedGraphContext } from '../context/workflow-nested-graph-context';
+import { useWorkflowStepDetail } from '../context/workflow-step-detail-context';
 import { useCurrentRun } from '../context/use-current-run';
 import { CheckIcon, CrossIcon, Icon } from '@/ds/icons';
 import { Txt } from '@/ds/components/Txt';
@@ -26,6 +25,7 @@ export type NestedNode = Node<
     isParallel?: boolean;
     canSuspend?: boolean;
     isForEach?: boolean;
+    metadata?: Record<string, unknown>;
   },
   'nested-node'
 >;
@@ -41,7 +41,7 @@ export function WorkflowNestedNode({
   stepsFlow,
 }: NodeProps<NestedNode> & WorkflowNestedNodeProps) {
   const { steps } = useCurrentRun();
-  const { showNestedGraph } = useContext(WorkflowNestedGraphContext);
+  const { showNestedGraph } = useWorkflowStepDetail();
 
   const {
     label,
@@ -81,7 +81,7 @@ export function WorkflowNestedNode({
         data-workflow-node
         data-workflow-step-status={displayStatus}
         className={cn(
-          'bg-surface3 rounded-lg w-[274px] border-sm border-border1',
+          'bg-surface3 rounded-lg w-[274px] border border-border1',
           hasSpecialBadge ? 'pt-0' : 'pt-2',
           displayStatus === 'success' && 'bg-accent1Darker',
           displayStatus === 'failed' && 'bg-accent2Darker',
@@ -126,16 +126,19 @@ export function WorkflowNestedNode({
             {displayStatus === 'suspended' && <PauseIcon className="text-accent3" />}
             {displayStatus === 'waiting' && <HourglassIcon className="text-accent5" />}
             {displayStatus === 'running' && <Loader2 className="text-accent6 animate-spin" />}
-            {!step && <CircleDashed className="text-icon2" />}
+            {!step && <CircleDashed className="text-neutral2" />}
           </Icon>
 
-          <Txt variant="ui-lg" className="text-icon6 font-medium inline-flex items-center gap-1 justify-between w-full">
+          <Txt
+            variant="ui-lg"
+            className="text-neutral6 font-medium inline-flex items-center gap-1 justify-between w-full"
+          >
             {label} {step?.startedAt && <Clock startedAt={step.startedAt} endedAt={step.endedAt} />}
           </Txt>
         </div>
 
         {description && (
-          <Txt variant="ui-sm" className="text-icon3 px-3 pb-2">
+          <Txt variant="ui-sm" className="text-neutral3 px-3 pb-2">
             {description}
           </Txt>
         )}

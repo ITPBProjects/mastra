@@ -253,7 +253,16 @@ export class MCPServer extends MCPServerBase {
       capabilities.prompts = { listChanged: true };
     }
 
-    this.server = new Server({ name: this.name, version: this.version }, { capabilities });
+    this.server = new Server(
+      {
+        name: this.name,
+        version: this.version,
+      },
+      {
+        capabilities,
+        ...(this.instructions ? { instructions: this.instructions } : {}),
+      },
+    );
 
     this.logger.info(
       `Initialized MCPServer '${this.name}' v${this.version} (ID: ${this.id}) with tools: ${Object.keys(this.convertedTools).join(', ')} and resources. Capabilities: ${JSON.stringify(capabilities)}`,
@@ -378,7 +387,16 @@ export class MCPServer extends MCPServerBase {
       capabilities.prompts = { listChanged: true };
     }
 
-    const serverInstance = new Server({ name: this.name, version: this.version }, { capabilities });
+    const serverInstance = new Server(
+      {
+        name: this.name,
+        version: this.version,
+      },
+      {
+        capabilities,
+        ...(this.instructions ? { instructions: this.instructions } : {}),
+      },
+    );
 
     // Register all handlers on the new server instance
     this.registerHandlersOnServer(serverInstance);
@@ -403,6 +421,14 @@ export class MCPServer extends MCPServerBase {
           };
           if (tool.outputSchema) {
             toolSpec.outputSchema = tool.outputSchema.jsonSchema;
+          }
+          // Include MCP tool annotations if present
+          if (tool.mcp?.annotations) {
+            toolSpec.annotations = tool.mcp.annotations;
+          }
+          // Include _meta if present
+          if (tool.mcp?._meta) {
+            toolSpec._meta = tool.mcp._meta;
           }
           return toolSpec;
         }),
@@ -471,7 +497,7 @@ export class MCPServer extends MCPServerBase {
             elicitation: sessionElicitation,
             extra,
           },
-          // @ts-ignore this is to let people know that the elicitation and extra keys are now nested under mcp.elicitation and mcp.extra in tool arguments
+          // @ts-expect-error this is to let people know that the elicitation and extra keys are now nested under mcp.elicitation and mcp.extra in tool arguments
           get elicitation() {
             throw new Error(`The "elicitation" key is now nested under "mcp.elicitation" in tool arguments`);
           },

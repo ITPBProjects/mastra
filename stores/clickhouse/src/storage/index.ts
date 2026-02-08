@@ -1,31 +1,16 @@
-import type { ClickHouseClient } from '@clickhouse/client';
+import type { ClickHouseClient, ClickHouseClientConfigOptions } from '@clickhouse/client';
 import { createClient } from '@clickhouse/client';
-import type { MastraMessageContentV2 } from '@mastra/core/agent';
 import { MastraError, ErrorDomain, ErrorCategory } from '@mastra/core/error';
-import type { SaveScorePayload, ScoreRowData, ScoringSource } from '@mastra/core/evals';
-import type { MastraDBMessage, StorageThreadType } from '@mastra/core/memory';
-import { createStorageErrorId, MastraStorage } from '@mastra/core/storage';
-import type {
-  TABLE_SCHEMAS,
-  PaginationInfo,
-  TABLE_NAMES,
-  WorkflowRun,
-  WorkflowRuns,
-  StoragePagination,
-  StorageDomains,
-  StorageResourceType,
-  StorageListWorkflowRunsInput,
-  UpdateWorkflowStateOptions,
-  SpanRecord,
-  TraceRecord,
-  TracesPaginatedArg,
-  CreateSpanRecord,
-} from '@mastra/core/storage';
-import type { StepResult, WorkflowRunState } from '@mastra/core/workflows';
+import { createStorageErrorId, MastraCompositeStore } from '@mastra/core/storage';
+import type { TABLE_NAMES, StorageDomains, TABLE_SCHEMAS } from '@mastra/core/storage';
 import { MemoryStorageClickhouse } from './domains/memory';
 import { ObservabilityStorageClickhouse } from './domains/observability';
 import { ScoresStorageClickhouse } from './domains/scores';
 import { WorkflowsStorageClickhouse } from './domains/workflows';
+
+// Export domain classes for direct use with MastraStorage composition
+export { MemoryStorageClickhouse, ObservabilityStorageClickhouse, ScoresStorageClickhouse, WorkflowsStorageClickhouse };
+export type { ClickhouseDomainConfig } from './db';
 
 type IntervalUnit =
   | 'NANOSECOND'
@@ -54,11 +39,49 @@ type ClickhouseTtlConfig = {
 };
 
 /**
+ * ClickHouse credentials configuration.
+ * Requires url, username, and password, plus supports all other ClickHouseClientConfigOptions.
+ */
+type ClickhouseCredentialsConfig = Omit<ClickHouseClientConfigOptions, 'url' | 'username' | 'password'> & {
+  /** ClickHouse server URL (required) */
+  url: string;
+  /** ClickHouse username (required) */
+  username: string;
+  /** ClickHouse password (required) */
+  password: string;
+};
+
+/**
  * ClickHouse configuration type.
  *
  * Accepts either:
  * - A pre-configured ClickHouse client: `{ id, client, ttl? }`
- * - URL/credentials config: `{ id, url, username, password, ttl? }`
+ * - ClickHouse credentials with optional advanced options: `{ id, url, username, password, ... }`
+ *
+ * All ClickHouseClientConfigOptions are supported (database, request_timeout,
+ * compression, keep_alive, max_open_connections, etc.).
+ *
+ * @example
+ * ```typescript
+ * // Simple credentials config
+ * const store = new ClickhouseStore({
+ *   id: 'my-store',
+ *   url: 'http://localhost:8123',
+ *   username: 'default',
+ *   password: '',
+ * });
+ *
+ * // With advanced options
+ * const store = new ClickhouseStore({
+ *   id: 'my-store',
+ *   url: 'http://localhost:8123',
+ *   username: 'default',
+ *   password: '',
+ *   request_timeout: 60000,
+ *   compression: { request: true, response: true },
+ *   keep_alive: { enabled: true },
+ * });
+ * ```
  */
 export type ClickhouseConfig = {
   id: string;
@@ -107,11 +130,7 @@ export type ClickhouseConfig = {
        */
       client: ClickHouseClient;
     }
-  | {
-      url: string;
-      username: string;
-      password: string;
-    }
+  | ClickhouseCredentialsConfig
 );
 
 /**
@@ -121,7 +140,29 @@ const isClientConfig = (config: ClickhouseConfig): config is ClickhouseConfig & 
   return 'client' in config;
 };
 
-export class ClickhouseStore extends MastraStorage {
+/**
+ * ClickHouse storage adapter for Mastra.
+ *
+ * Access domain-specific storage via `getStore()`:
+ *
+ * @example
+ * ```typescript
+ * const storage = new ClickhouseStore({ id: 'my-store', url: '...', username: '...', password: '...' });
+ *
+ * // Access memory domain
+ * const memory = await storage.getStore('memory');
+ * await memory?.saveThread({ thread });
+ *
+ * // Access workflows domain
+ * const workflows = await storage.getStore('workflows');
+ * await workflows?.persistWorkflowSnapshot({ workflowName, runId, snapshot });
+ *
+ * // Access observability domain
+ * const observability = await storage.getStore('observability');
+ * await observability?.createSpan(span);
+ * ```
+ */
+export class ClickhouseStore extends MastraCompositeStore {
   protected db: ClickHouseClient;
   protected ttl: ClickhouseConfig['ttl'] = {};
 
@@ -146,12 +187,15 @@ export class ClickhouseStore extends MastraStorage {
       if (typeof config.password !== 'string') {
         throw new Error('ClickhouseStore: password must be a string.');
       }
-      // Create client from credentials
+
+      // Extract Mastra-specific config, pass rest to ClickHouse client
+      const { id, ttl, disableInit, clickhouse_settings, ...clientOptions } = config;
+
+      // Create client with all provided options
       this.db = createClient({
-        url: config.url,
-        username: config.username,
-        password: config.password,
+        ...clientOptions,
         clickhouse_settings: {
+          ...clickhouse_settings,
           date_time_input_format: 'best_effort',
           date_time_output_format: 'iso', // This is crucial
           use_client_time_zone: 1,
@@ -173,26 +217,6 @@ export class ClickhouseStore extends MastraStorage {
       scores,
       memory,
       observability,
-    };
-  }
-
-  get supports(): {
-    selectByIncludeResourceScope: boolean;
-    resourceWorkingMemory: boolean;
-    hasColumn: boolean;
-    createTable: boolean;
-    deleteMessages: boolean;
-    listScoresBySpan: boolean;
-    observabilityInstance: boolean;
-  } {
-    return {
-      selectByIncludeResourceScope: true,
-      resourceWorkingMemory: true,
-      hasColumn: true,
-      createTable: true,
-      deleteMessages: true,
-      listScoresBySpan: true,
-      observabilityInstance: true,
     };
   }
 
@@ -232,200 +256,6 @@ export class ClickhouseStore extends MastraStorage {
     }
   }
 
-  async updateWorkflowResults({
-    workflowName,
-    runId,
-    stepId,
-    result,
-    requestContext,
-  }: {
-    workflowName: string;
-    runId: string;
-    stepId: string;
-    result: StepResult<any, any, any, any>;
-    requestContext: Record<string, any>;
-  }): Promise<Record<string, StepResult<any, any, any, any>>> {
-    return this.stores.workflows.updateWorkflowResults({ workflowName, runId, stepId, result, requestContext });
-  }
-
-  async updateWorkflowState({
-    workflowName,
-    runId,
-    opts,
-  }: {
-    workflowName: string;
-    runId: string;
-    opts: UpdateWorkflowStateOptions;
-  }): Promise<WorkflowRunState | undefined> {
-    return this.stores.workflows.updateWorkflowState({ workflowName, runId, opts });
-  }
-
-  async persistWorkflowSnapshot({
-    workflowName,
-    runId,
-    resourceId,
-    snapshot,
-  }: {
-    workflowName: string;
-    runId: string;
-    resourceId?: string;
-    snapshot: WorkflowRunState;
-  }): Promise<void> {
-    return this.stores.workflows.persistWorkflowSnapshot({ workflowName, runId, resourceId, snapshot });
-  }
-
-  async loadWorkflowSnapshot({
-    workflowName,
-    runId,
-  }: {
-    workflowName: string;
-    runId: string;
-  }): Promise<WorkflowRunState | null> {
-    return this.stores.workflows.loadWorkflowSnapshot({ workflowName, runId });
-  }
-
-  async listWorkflowRuns(args: StorageListWorkflowRunsInput = {}): Promise<WorkflowRuns> {
-    return this.stores.workflows.listWorkflowRuns(args);
-  }
-
-  async getWorkflowRunById({
-    runId,
-    workflowName,
-  }: {
-    runId: string;
-    workflowName?: string;
-  }): Promise<WorkflowRun | null> {
-    return this.stores.workflows.getWorkflowRunById({ runId, workflowName });
-  }
-
-  async deleteWorkflowRunById({ runId, workflowName }: { runId: string; workflowName: string }): Promise<void> {
-    return this.stores.workflows.deleteWorkflowRunById({ runId, workflowName });
-  }
-
-  async getThreadById({ threadId }: { threadId: string }): Promise<StorageThreadType | null> {
-    return this.stores.memory.getThreadById({ threadId });
-  }
-
-  async saveThread({ thread }: { thread: StorageThreadType }): Promise<StorageThreadType> {
-    return this.stores.memory.saveThread({ thread });
-  }
-
-  async updateThread({
-    id,
-    title,
-    metadata,
-  }: {
-    id: string;
-    title: string;
-    metadata: Record<string, unknown>;
-  }): Promise<StorageThreadType> {
-    return this.stores.memory.updateThread({ id, title, metadata });
-  }
-
-  async deleteThread({ threadId }: { threadId: string }): Promise<void> {
-    return this.stores.memory.deleteThread({ threadId });
-  }
-
-  async deleteMessages(messageIds: string[]): Promise<void> {
-    return this.stores.memory.deleteMessages(messageIds);
-  }
-
-  async saveMessages(args: { messages: MastraDBMessage[] }): Promise<{ messages: MastraDBMessage[] }> {
-    return this.stores.memory.saveMessages(args);
-  }
-
-  async updateMessages(args: {
-    messages: (Partial<Omit<MastraDBMessage, 'createdAt'>> & {
-      id: string;
-      threadId?: string;
-      content?: { metadata?: MastraMessageContentV2['metadata']; content?: MastraMessageContentV2['content'] };
-    })[];
-  }): Promise<MastraDBMessage[]> {
-    return this.stores.memory.updateMessages(args);
-  }
-
-  async listMessagesById({ messageIds }: { messageIds: string[] }): Promise<{ messages: MastraDBMessage[] }> {
-    return this.stores.memory.listMessagesById({ messageIds });
-  }
-
-  async getResourceById({ resourceId }: { resourceId: string }): Promise<StorageResourceType | null> {
-    return this.stores.memory.getResourceById({ resourceId });
-  }
-
-  async saveResource({ resource }: { resource: StorageResourceType }): Promise<StorageResourceType> {
-    return this.stores.memory.saveResource({ resource });
-  }
-
-  async updateResource({
-    resourceId,
-    workingMemory,
-    metadata,
-  }: {
-    resourceId: string;
-    workingMemory?: string;
-    metadata?: Record<string, unknown>;
-  }): Promise<StorageResourceType> {
-    return this.stores.memory.updateResource({ resourceId, workingMemory, metadata });
-  }
-
-  async getScoreById({ id }: { id: string }): Promise<ScoreRowData | null> {
-    return this.stores.scores.getScoreById({ id });
-  }
-
-  async saveScore(score: SaveScorePayload): Promise<{ score: ScoreRowData }> {
-    return this.stores.scores.saveScore(score);
-  }
-
-  async listScoresByRunId({
-    runId,
-    pagination,
-  }: {
-    runId: string;
-    pagination: StoragePagination;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
-    return this.stores.scores.listScoresByRunId({ runId, pagination });
-  }
-
-  async listScoresByEntityId({
-    entityId,
-    entityType,
-    pagination,
-  }: {
-    pagination: StoragePagination;
-    entityId: string;
-    entityType: string;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
-    return this.stores.scores.listScoresByEntityId({ entityId, entityType, pagination });
-  }
-
-  async listScoresByScorerId({
-    scorerId,
-    pagination,
-    entityId,
-    entityType,
-    source,
-  }: {
-    scorerId: string;
-    pagination: StoragePagination;
-    entityId?: string;
-    entityType?: string;
-    source?: ScoringSource;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
-    return this.stores.scores.listScoresByScorerId({ scorerId, pagination, entityId, entityType, source });
-  }
-
-  async listScoresBySpan({
-    traceId,
-    spanId,
-    pagination,
-  }: {
-    traceId: string;
-    spanId: string;
-    pagination: StoragePagination;
-  }): Promise<{ pagination: PaginationInfo; scores: ScoreRowData[] }> {
-    return this.stores.scores.listScoresBySpan({ traceId, spanId, pagination });
-  }
-
   /**
    * Closes the ClickHouse client connection.
    *
@@ -445,97 +275,5 @@ export class ClickhouseStore extends MastraStorage {
         error,
       );
     }
-  }
-
-  // Observability methods
-
-  async createSpan(span: CreateSpanRecord): Promise<void> {
-    if (!this.stores.observability) {
-      throw new MastraError({
-        id: createStorageErrorId('CLICKHOUSE', 'OBSERVABILITY', 'NOT_INITIALIZED'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.SYSTEM,
-        text: 'Observability storage is not initialized',
-      });
-    }
-    return this.stores.observability.createSpan(span);
-  }
-
-  async updateSpan(params: {
-    spanId: string;
-    traceId: string;
-    updates: Partial<Omit<SpanRecord, 'spanId' | 'traceId'>>;
-  }): Promise<void> {
-    if (!this.stores.observability) {
-      throw new MastraError({
-        id: createStorageErrorId('CLICKHOUSE', 'OBSERVABILITY', 'NOT_INITIALIZED'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.SYSTEM,
-        text: 'Observability storage is not initialized',
-      });
-    }
-    return this.stores.observability.updateSpan(params);
-  }
-
-  async getTrace(traceId: string): Promise<TraceRecord | null> {
-    if (!this.stores.observability) {
-      throw new MastraError({
-        id: createStorageErrorId('CLICKHOUSE', 'OBSERVABILITY', 'NOT_INITIALIZED'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.SYSTEM,
-        text: 'Observability storage is not initialized',
-      });
-    }
-    return this.stores.observability.getTrace(traceId);
-  }
-
-  async getTracesPaginated(args: TracesPaginatedArg): Promise<{ pagination: PaginationInfo; spans: SpanRecord[] }> {
-    if (!this.stores.observability) {
-      throw new MastraError({
-        id: createStorageErrorId('CLICKHOUSE', 'OBSERVABILITY', 'NOT_INITIALIZED'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.SYSTEM,
-        text: 'Observability storage is not initialized',
-      });
-    }
-    return this.stores.observability.getTracesPaginated(args);
-  }
-
-  async batchCreateSpans(args: { records: CreateSpanRecord[] }): Promise<void> {
-    if (!this.stores.observability) {
-      throw new MastraError({
-        id: createStorageErrorId('CLICKHOUSE', 'OBSERVABILITY', 'NOT_INITIALIZED'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.SYSTEM,
-        text: 'Observability storage is not initialized',
-      });
-    }
-    return this.stores.observability.batchCreateSpans(args);
-  }
-
-  async batchUpdateSpans(args: {
-    records: { traceId: string; spanId: string; updates: Partial<Omit<SpanRecord, 'spanId' | 'traceId'>> }[];
-  }): Promise<void> {
-    if (!this.stores.observability) {
-      throw new MastraError({
-        id: createStorageErrorId('CLICKHOUSE', 'OBSERVABILITY', 'NOT_INITIALIZED'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.SYSTEM,
-        text: 'Observability storage is not initialized',
-      });
-    }
-    return this.stores.observability.batchUpdateSpans(args);
-  }
-
-  async batchDeleteTraces(args: { traceIds: string[] }): Promise<void> {
-    if (!this.stores.observability) {
-      throw new MastraError({
-        id: createStorageErrorId('CLICKHOUSE', 'OBSERVABILITY', 'NOT_INITIALIZED'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.SYSTEM,
-        text: 'Observability storage is not initialized',
-      });
-    }
-    return this.stores.observability.batchDeleteTraces(args);
   }
 }

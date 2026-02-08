@@ -13,11 +13,16 @@ import type {
   TraceState,
   IModelSpanTracker,
   AIModelGenerationSpan,
+  EntityType,
 } from '@mastra/core/observability';
 
 import { SpanType, InternalSpans } from '@mastra/core/observability';
 import { ModelSpanTracker } from '../model-tracing';
-import { deepClean } from './serialization';
+import { deepClean, mergeSerializationOptions } from './serialization';
+import type { DeepCleanOptions } from './serialization';
+
+/** Extended span type that includes getParentSpan method available on BaseSpan instances */
+type AnyBaseSpan = AnySpan & { getParentSpan(includeInternalSpans?: boolean): AnySpan | undefined };
 
 /**
  * Determines if a span type should be considered internal based on flags.
@@ -127,29 +132,46 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
   public metadata?: Record<string, any>;
   public tags?: string[];
   public traceState?: TraceState;
+  /** Entity type that created the span (e.g., agent, workflow) */
+  public entityType?: EntityType;
+  /** Entity ID that created the span */
+  public entityId?: string;
+  /** Entity name that created the span */
+  public entityName?: string;
   /** Parent span ID (for root spans that are children of external spans) */
   protected parentSpanId?: string;
+  /** Deep clean options for serialization */
+  protected deepCleanOptions: DeepCleanOptions;
 
   constructor(options: CreateSpanOptions<TType>, observabilityInstance: ObservabilityInstance) {
+    // Get serialization options from observability instance config
+    const serializationOptions = observabilityInstance.getConfig().serializationOptions;
+    this.deepCleanOptions = mergeSerializationOptions(serializationOptions);
+
     this.name = options.name;
     this.type = options.type;
-    this.attributes = deepClean(options.attributes) || ({} as SpanTypeMap[TType]);
-    this.metadata = deepClean(options.metadata);
+    this.attributes = deepClean(options.attributes, this.deepCleanOptions) || ({} as SpanTypeMap[TType]);
+    this.metadata = deepClean(options.metadata, this.deepCleanOptions);
     this.parent = options.parent;
-    this.startTime = new Date();
+    this.startTime = options.startTime ?? new Date();
     this.observabilityInstance = observabilityInstance;
     this.isEvent = options.isEvent ?? false;
     this.isInternal = isSpanInternal(this.type, options.tracingPolicy?.internal);
     this.traceState = options.traceState;
     // Tags are only set for root spans (spans without a parent)
     this.tags = !options.parent && options.tags?.length ? options.tags : undefined;
+    // Entity identification - inherit from closest non-internal parent if not explicitly provided
+    const entityParent = this.getParentSpan(false);
+    this.entityType = options.entityType ?? entityParent?.entityType;
+    this.entityId = options.entityId ?? entityParent?.entityId;
+    this.entityName = options.entityName ?? entityParent?.entityName;
 
     if (this.isEvent) {
       // Event spans don't have endTime or input.
       // Event spans are immediately emitted by the BaseObservability class via the end() event.
-      this.output = deepClean(options.output);
+      this.output = deepClean(options.output, this.deepCleanOptions);
     } else {
-      this.input = deepClean(options.input);
+      this.input = deepClean(options.input, this.deepCleanOptions);
     }
   }
 
@@ -193,16 +215,28 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
   /** Returns `TRUE` if the span is a valid span (not a NO-OP Span) */
   abstract get isValid(): boolean;
 
+  /** Get the closest parent span, optionally skipping internal spans */
+  public getParentSpan(includeInternalSpans?: boolean): AnySpan | undefined {
+    if (!this.parent) {
+      return undefined;
+    }
+    if (includeInternalSpans) return this.parent;
+    if (this.parent.isInternal) return (this.parent as AnyBaseSpan).getParentSpan(includeInternalSpans);
+    return this.parent;
+  }
+
   /** Get the closest parent spanId that isn't an internal span */
   public getParentSpanId(includeInternalSpans?: boolean): string | undefined {
     if (!this.parent) {
-      // Return parent span ID if available, otherwise undefined
+      // Return parent span ID if available (for root spans with external parent)
       return this.parentSpanId;
     }
-    if (includeInternalSpans) return this.parent.id;
-    if (this.parent.isInternal) return this.parent.getParentSpanId(includeInternalSpans);
-
-    return this.parent.id;
+    const parentSpan = this.getParentSpan(includeInternalSpans);
+    if (parentSpan) {
+      return parentSpan.id;
+    }
+    // All ancestors are internal, recurse to get root's parentSpanId
+    return this.parent.getParentSpanId(includeInternalSpans);
   }
 
   /** Find the closest parent span of a specific type by walking up the parent chain */
@@ -221,17 +255,24 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
 
   /** Returns a lightweight span ready for export */
   public exportSpan(includeInternalSpans?: boolean): ExportedSpan<TType> {
+    // Check if input/output should be hidden based on traceState
+    const hideInput = this.traceState?.hideInput ?? false;
+    const hideOutput = this.traceState?.hideOutput ?? false;
+
     return {
       id: this.id,
       traceId: this.traceId,
       name: this.name,
       type: this.type,
+      entityType: this.entityType,
+      entityId: this.entityId,
+      entityName: this.entityName,
       attributes: this.attributes,
       metadata: this.metadata,
       startTime: this.startTime,
       endTime: this.endTime,
-      input: this.input,
-      output: this.output,
+      input: hideInput ? undefined : this.input,
+      output: hideOutput ? undefined : this.output,
       errorInfo: this.errorInfo,
       isEvent: this.isEvent,
       isRootSpan: this.isRootSpan,

@@ -1,5 +1,36 @@
 import { z, ZodSchema } from 'zod';
 import type { ServerRoute } from '@mastra/server/server-adapter';
+import { getZodTypeName, getZodDef } from '@mastra/core/utils';
+
+/**
+ * Normalizes a route path to ensure consistent formatting.
+ * - Removes leading/trailing whitespace
+ * - Validates no path traversal (..), query strings (?), or fragments (#)
+ * - Collapses multiple consecutive slashes
+ * - Removes trailing slashes
+ * - Ensures leading slash (unless empty)
+ *
+ * @param path - The route path to normalize
+ * @returns The normalized path (empty string for root paths)
+ * @throws Error if path contains invalid characters
+ */
+export function normalizeRoutePath(path: string): string {
+  let normalized = path.trim();
+  if (normalized.includes('..') || normalized.includes('?') || normalized.includes('#')) {
+    throw new Error(`Invalid route path: "${path}". Path cannot contain '..', '?', or '#'`);
+  }
+  normalized = normalized.replace(/\/+/g, '/');
+  if (normalized === '/' || normalized === '') {
+    return '';
+  }
+  if (normalized.endsWith('/')) {
+    normalized = normalized.slice(0, -1);
+  }
+  if (!normalized.startsWith('/')) {
+    normalized = `/${normalized}`;
+  }
+  return normalized;
+}
 
 /**
  * Generate context-aware test value based on field name
@@ -12,17 +43,32 @@ export function generateContextualValue(fieldName?: string): string {
   if (field === 'entitytype') return 'AGENT';
   if (field === 'entityid') return 'test-agent';
   if (field === 'role') return 'user';
-  if (field === 'fields') return 'status'; // For workflow execution result field filtering
+  if (field === 'fields') return 'result'; // For workflow execution result field filtering (status is always included)
+  // JSON-encoded query params (wrapped with wrapSchemaForQueryParams)
+  if (field === 'tags') return '["test-tag"]'; // For observability traces filtering
+
+  // Version comparison query params (from/to are version IDs)
+  // Both use the same known version ID - comparing a version to itself returns empty diffs,
+  // which is valid for route integration tests that verify the endpoint responds correctly
+  if (field === 'from') return 'test-version-id';
+  if (field === 'to') return 'test-version-id';
+
+  // Workspace filesystem - content and query fields
+  if (field === 'content') return 'test content'; // For write/index operations
+  if (field === 'query') return 'test'; // For search operations
 
   if (field.includes('agent')) return 'test-agent';
   if (field.includes('workflow')) return 'test-workflow';
   if (field.includes('tool')) return 'test-tool';
+  if (field.includes('skill')) return 'test-skill';
+  if (field.includes('reference') && field.includes('path')) return 'test-reference.md';
   if (field.includes('thread')) return 'test-thread';
   if (field.includes('resource')) return 'test-resource';
   if (field.includes('run')) return 'test-run';
   if (field.includes('step')) return 'test-step';
   if (field.includes('task')) return 'test-task';
   if (field.includes('scorer') || field.includes('score')) return 'test-scorer';
+  if (field.includes('processor')) return 'test-processor';
   if (field.includes('trace')) return 'test-trace';
   if (field.includes('span')) return 'test-span';
   if (field.includes('vector')) return 'test-vector';
@@ -40,47 +86,55 @@ export function generateContextualValue(fieldName?: string): string {
  * Generate valid test data from a Zod schema
  */
 export function generateValidDataFromSchema(schema: z.ZodTypeAny, fieldName?: string): any {
-  while (schema instanceof z.ZodEffects) {
-    schema = schema._def.schema;
+  let typeName = getZodTypeName(schema);
+  let def = getZodDef(schema);
+
+  // Unwrap effects first
+  while (typeName === 'ZodEffects') {
+    schema = def.schema;
+    typeName = getZodTypeName(schema);
+    def = getZodDef(schema);
   }
 
-  if (schema instanceof z.ZodOptional || schema instanceof z.ZodNullable) {
-    return generateValidDataFromSchema(schema._def.innerType, fieldName);
+  if (typeName === 'ZodOptional' || typeName === 'ZodNullable') {
+    return generateValidDataFromSchema(def.innerType, fieldName);
   }
-  if (schema instanceof z.ZodDefault) {
-    return schema._def.defaultValue();
+  if (typeName === 'ZodDefault') {
+    return def.defaultValue();
   }
 
-  if (schema instanceof z.ZodString) return generateContextualValue(fieldName);
-  if (schema instanceof z.ZodNumber) return 10;
-  if (schema instanceof z.ZodBoolean) return true;
-  if (schema instanceof z.ZodNull) return null;
-  if (schema instanceof z.ZodUndefined) return undefined;
-  if (schema instanceof z.ZodDate) return new Date();
-  if (schema instanceof z.ZodBigInt) return BigInt(0);
+  if (typeName === 'ZodString') return generateContextualValue(fieldName);
+  if (typeName === 'ZodNumber') return 10;
+  if (typeName === 'ZodBoolean') return true;
+  if (typeName === 'ZodNull') return null;
+  if (typeName === 'ZodUndefined') return undefined;
+  if (typeName === 'ZodDate') return new Date();
+  if (typeName === 'ZodBigInt') return BigInt(0);
 
-  if (schema instanceof z.ZodLiteral) return schema._def.value;
+  if (typeName === 'ZodLiteral') return def.value;
 
-  if (schema instanceof z.ZodEnum) return schema._def.values[0];
-  if (schema instanceof z.ZodNativeEnum) {
-    const values = Object.values(schema._def.values);
+  if (typeName === 'ZodEnum') return def.values[0];
+  if (typeName === 'ZodNativeEnum') {
+    const values = Object.values(def.values);
     return values[0];
   }
 
-  if (schema instanceof z.ZodArray) {
-    return [generateValidDataFromSchema(schema._def.type, fieldName)];
+  if (typeName === 'ZodArray') {
+    return [generateValidDataFromSchema(def.type, fieldName)];
   }
 
-  if (schema instanceof z.ZodObject) {
-    const shape = schema._def.shape();
+  if (typeName === 'ZodObject') {
+    const shape = typeof def.shape === 'function' ? def.shape() : def.shape;
     const obj: any = {};
     for (const [key, fieldSchema] of Object.entries(shape)) {
-      if (fieldSchema instanceof z.ZodOptional) {
+      const fieldTypeName = getZodTypeName(fieldSchema as z.ZodTypeAny);
+      if (fieldTypeName === 'ZodOptional') {
         // Special case: workflow routes need inputData field even when optional
         // because _run.start() expects { inputData?, ... } structure, not just {}
         // Without this, z.object({}).safeParse(undefined) fails with "Required" error
         if (key === 'inputData') {
-          const innerType = fieldSchema._def.innerType;
+          const fieldDef = getZodDef(fieldSchema as z.ZodTypeAny);
+          const innerType = fieldDef.innerType;
           obj[key] = generateValidDataFromSchema(innerType, key);
         }
         continue;
@@ -90,32 +144,45 @@ export function generateValidDataFromSchema(schema: z.ZodTypeAny, fieldName?: st
     return obj;
   }
 
-  if (schema instanceof z.ZodRecord) {
-    return { key: generateValidDataFromSchema(schema._def.valueType, fieldName) };
+  if (typeName === 'ZodRecord') {
+    return { key: generateValidDataFromSchema(def.valueType, fieldName) };
   }
 
-  if (schema instanceof z.ZodUnion) {
-    return generateValidDataFromSchema(schema._def.options[0], fieldName);
+  if (typeName === 'ZodUnion') {
+    // Special case: for content field in messages, use string format (simpler and more reliable)
+    if (fieldName === 'content') {
+      // Check if one of the options is ZodString
+      for (const option of def.options) {
+        if (getZodTypeName(option) === 'ZodString') {
+          return 'test message content';
+        }
+      }
+    }
+    return generateValidDataFromSchema(def.options[0], fieldName);
   }
 
-  if (schema instanceof z.ZodDiscriminatedUnion) {
-    const options = Array.from(schema._def.options.values());
+  if (typeName === 'ZodDiscriminatedUnion') {
+    const options = Array.from(def.options.values());
     return generateValidDataFromSchema(options[0] as z.ZodTypeAny, fieldName);
   }
 
-  if (schema instanceof z.ZodIntersection) {
-    const left = generateValidDataFromSchema(schema._def.left, fieldName);
-    const right = generateValidDataFromSchema(schema._def.right, fieldName);
+  if (typeName === 'ZodIntersection') {
+    const left = generateValidDataFromSchema(def.left, fieldName);
+    const right = generateValidDataFromSchema(def.right, fieldName);
     return { ...left, ...right };
   }
 
-  if (schema instanceof z.ZodTuple) {
-    return schema._def.items.map((item: z.ZodTypeAny) => generateValidDataFromSchema(item, fieldName));
+  if (typeName === 'ZodTuple') {
+    return def.items.map((item: z.ZodTypeAny) => generateValidDataFromSchema(item, fieldName));
   }
 
-  if (schema instanceof z.ZodAny || schema instanceof z.ZodUnknown) {
+  if (typeName === 'ZodAny' || typeName === 'ZodUnknown') {
     if (fieldName === 'content') {
       return [{ type: 'text', text: 'test message content' }];
+    }
+    // Special case: message parts for processor messages
+    if (fieldName === 'parts') {
+      return [{ type: 'text', text: 'test message part' }];
     }
     // Special case: workflow inputData is z.unknown() but needs to be an object
     // to match the workflow's inputSchema (typically z.object({}))
@@ -141,7 +208,13 @@ export function generateValidDataFromSchema(schema: z.ZodTypeAny, fieldName?: st
 export function getDefaultValidPathParams(route: ServerRoute): Record<string, any> {
   const params: Record<string, any> = {};
 
-  if (route.path.includes(':agentId')) params.agentId = 'test-agent';
+  // For stored agent routes (versions), use 'test-stored-agent' to match test context
+  // For regular agent routes, use 'test-agent'
+  if (route.path.includes(':agentId') && route.path.includes('/stored/agents/')) {
+    params.agentId = 'test-stored-agent';
+  } else if (route.path.includes(':agentId')) {
+    params.agentId = 'test-agent';
+  }
   if (route.path.includes(':workflowId')) params.workflowId = 'test-workflow';
   if (route.path.includes(':toolId')) params.toolId = 'test-tool';
   if (route.path.includes(':threadId')) params.threadId = 'test-thread';
@@ -160,11 +233,19 @@ export function getDefaultValidPathParams(route: ServerRoute): Record<string, an
   if (route.path.includes(':entityId')) params.entityId = 'test-agent';
   if (route.path.includes(':actionId')) params.actionId = 'merge-template';
   if (route.path.includes(':storedAgentId')) params.storedAgentId = 'test-stored-agent';
-
+  if (route.path.includes(':versionId')) params.versionId = 'test-version-id';
+  if (route.path.includes(':processorId')) params.processorId = 'test-processor';
   // MCP route params - need to get actual server ID from test context
   if (route.path.includes(':id') && route.path.includes('/mcp/v0/servers/')) params.id = 'test-server-1';
   if (route.path.includes(':serverId')) params.serverId = 'test-server-1';
   if (route.path.includes(':toolId') && route.path.includes('/mcp/')) params.toolId = 'getWeather';
+
+  // Workspace route params
+  if (route.path.includes(':workspaceId')) params.workspaceId = 'test-workspace';
+
+  // Skills route params
+  if (route.path.includes(':skillName')) params.skillName = 'test-skill';
+  if (route.path.includes(':referencePath')) params.referencePath = 'test-reference.md';
 
   return params;
 }

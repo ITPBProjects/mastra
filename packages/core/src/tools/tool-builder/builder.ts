@@ -9,13 +9,15 @@ import {
   applyCompatLayer,
   convertZodSchemaToAISDKSchema,
 } from '@mastra/schema-compat';
+import { zodToJsonSchema } from '@mastra/schema-compat/zod-to-json';
 import { z } from 'zod';
 import { MastraBase } from '../../base';
 import { ErrorCategory, MastraError, ErrorDomain } from '../../error';
-import { SpanType, wrapMastra, executeWithContext } from '../../observability';
+import { SpanType, wrapMastra, executeWithContext, EntityType } from '../../observability';
 import { RequestContext } from '../../request-context';
 import { isVercelTool } from '../../tools/toolchecks';
 import type { ToolOptions } from '../../utils';
+import { isZodObject } from '../../utils/zod-utils';
 import type { SuspendOptions } from '../../workflows';
 import { ToolStream } from '../stream';
 import type { CoreTool, MastraToolInvocationOptions, ToolAction, VercelTool, VercelToolV5 } from '../types';
@@ -54,7 +56,10 @@ export class CoreToolBuilder extends MastraBase {
     this.originalTool = input.originalTool;
     this.options = input.options;
     this.logType = input.logType;
-    if (!isVercelTool(this.originalTool) && input.autoResumeSuspendedTools) {
+    if (
+      !isVercelTool(this.originalTool) &&
+      (input.autoResumeSuspendedTools || (this.originalTool as ToolAction<any, any>).id?.startsWith('agent-'))
+    ) {
       let schema = this.originalTool.inputSchema;
       if (typeof schema === 'function') {
         schema = schema();
@@ -62,9 +67,9 @@ export class CoreToolBuilder extends MastraBase {
       if (!schema) {
         schema = z.object({});
       }
-      if (schema instanceof z.ZodObject) {
+      if (isZodObject(schema)) {
         this.originalTool.inputSchema = schema.extend({
-          suspendedToolRunId: z.string().describe('The runId of the suspended tool').optional(),
+          suspendedToolRunId: z.string().describe('The runId of the suspended tool').nullable().optional().default(''),
           resumeData: z
             .any()
             .describe('The resumeData object created from the resumeSchema of suspended tool')
@@ -146,10 +151,11 @@ export class CoreToolBuilder extends MastraBase {
   };
 
   // For provider-defined tools, we need to include all required properties
+  // AI SDK v5 uses type: 'provider-defined', AI SDK v6 uses type: 'provider'
   private buildProviderTool(tool: ToolToConvert): (CoreTool & { id: `${string}.${string}` }) | undefined {
     if (
       'type' in tool &&
-      tool.type === 'provider-defined' &&
+      (tool.type === 'provider-defined' || tool.type === 'provider') &&
       'id' in tool &&
       typeof tool.id === 'string' &&
       tool.id.includes('.')
@@ -239,8 +245,17 @@ export class CoreToolBuilder extends MastraBase {
     logType?: 'tool' | 'toolset' | 'client-tool',
     processedSchema?: z.ZodTypeAny,
   ) {
-    // dont't add memory or mastra to logging
-    const { logger, mastra: _mastra, memory: _memory, requestContext, model, ...rest } = options;
+    // don't add memory, mastra, or tracing context to logging (tracingContext may contain sensitive observability credentials)
+    const {
+      logger,
+      mastra: _mastra,
+      memory: _memory,
+      requestContext,
+      model,
+      tracingContext: _tracingContext,
+      tracingPolicy: _tracingPolicy,
+      ...rest
+    } = options;
     const logModelObject = {
       modelId: model?.modelId,
       provider: model?.provider,
@@ -263,8 +278,10 @@ export class CoreToolBuilder extends MastraBase {
         type: SpanType.TOOL_CALL,
         name: `tool: '${options.name}'`,
         input: args,
+        entityType: EntityType.TOOL,
+        entityId: options.name,
+        entityName: options.name,
         attributes: {
-          toolId: options.name,
           toolDescription: options.description,
           toolType: logType || 'tool',
         },
@@ -328,7 +345,9 @@ export class CoreToolBuilder extends MastraBase {
               suspendData = args;
               const newSuspendOptions = {
                 ...(suspendOptions ?? {}),
-                resumeSchema: suspendOptions?.resumeSchema ?? resumeSchema,
+                resumeSchema:
+                  suspendOptions?.resumeSchema ??
+                  (resumeSchema ? JSON.stringify(zodToJsonSchema(resumeSchema)) : undefined),
               };
               return execOptions.suspend?.(args, newSuspendOptions);
             },
@@ -396,7 +415,7 @@ export class CoreToolBuilder extends MastraBase {
             const resumeValidation = validateToolInput(resumeSchema, resumeData, options.name);
             if (resumeValidation.error) {
               logger?.warn(resumeValidation.error.message);
-              toolSpan?.end({ output: resumeValidation.error });
+              toolSpan?.end({ output: resumeValidation.error, attributes: { success: false } });
               return resumeValidation.error as any;
             }
           }
@@ -409,7 +428,7 @@ export class CoreToolBuilder extends MastraBase {
           const suspendValidation = validateToolSuspendData(suspendSchema, suspendData, options.name);
           if (suspendValidation.error) {
             logger?.warn(suspendValidation.error.message);
-            toolSpan?.end({ output: suspendValidation.error });
+            toolSpan?.end({ output: suspendValidation.error, attributes: { success: false } });
             return suspendValidation.error as any;
           }
         }
@@ -417,7 +436,7 @@ export class CoreToolBuilder extends MastraBase {
         // Skip validation if suspend was called without a result
         const shouldSkipValidation = typeof result === 'undefined' && !!suspendData;
         if (shouldSkipValidation) {
-          toolSpan?.end({ output: result });
+          toolSpan?.end({ output: result, attributes: { success: true } });
           return result;
         }
 
@@ -429,17 +448,17 @@ export class CoreToolBuilder extends MastraBase {
           const outputValidation = validateToolOutput(outputSchema, result, options.name, false);
           if (outputValidation.error) {
             logger?.warn(outputValidation.error.message);
-            toolSpan?.end({ output: outputValidation.error });
+            toolSpan?.end({ output: outputValidation.error, attributes: { success: false } });
             return outputValidation.error;
           }
           result = outputValidation.data;
         }
 
         // Return result (validated for Vercel tools, already validated for Mastra tools)
-        toolSpan?.end({ output: result });
+        toolSpan?.end({ output: result, attributes: { success: true } });
         return result;
       } catch (error) {
-        toolSpan?.error({ error: error as Error });
+        toolSpan?.error({ error: error as Error, attributes: { success: false } });
         throw error;
       }
     };
@@ -478,7 +497,7 @@ export class CoreToolBuilder extends MastraBase {
             domain: ErrorDomain.TOOL,
             category: ErrorCategory.USER,
             details: {
-              errorMessage: String(error),
+              errorMessage: String(err),
               argsJson: JSON.stringify(args),
               model: model?.modelId ?? '',
             },
@@ -567,7 +586,7 @@ export class CoreToolBuilder extends MastraBase {
 
     if (applicableLayer && originalSchema) {
       // Get the transformed Zod schema (with constraints removed/modified)
-      processedZodSchema = applicableLayer.processZodType(originalSchema);
+      processedZodSchema = applicableLayer.processZodType(originalSchema) as z.ZodTypeAny;
       // Convert to AI SDK Schema for the LLM
       processedSchema = applyCompatLayer({
         schema: originalSchema,
@@ -599,10 +618,28 @@ export class CoreToolBuilder extends MastraBase {
       });
     }
 
+    // Map AI SDK's needsApproval to our requireApproval
+    // needsApproval can be boolean or a function that takes input and returns boolean
+    let requireApproval = this.options.requireApproval;
+    let needsApprovalFn: ((input: any) => boolean | Promise<boolean>) | undefined;
+
+    if (isVercelTool(this.originalTool) && 'needsApproval' in this.originalTool) {
+      const needsApproval = (this.originalTool as any).needsApproval;
+      if (typeof needsApproval === 'boolean') {
+        requireApproval = needsApproval;
+      } else if (typeof needsApproval === 'function') {
+        // Store the function to evaluate it per-call
+        needsApprovalFn = needsApproval;
+        // Set requireApproval to true so the tool-call-step knows to check the function
+        requireApproval = true;
+      }
+    }
+
     const definition = {
       type: 'function' as const,
       description: this.originalTool.description,
-      requireApproval: this.options.requireApproval,
+      requireApproval,
+      needsApprovalFn,
       hasSuspendSchema: !!this.getSuspendSchema(),
       execute: this.originalTool.execute
         ? this.createExecute(
@@ -620,6 +657,7 @@ export class CoreToolBuilder extends MastraBase {
       parameters: processedSchema ?? z.object({}),
       outputSchema: processedOutputSchema,
       providerOptions: 'providerOptions' in this.originalTool ? this.originalTool.providerOptions : undefined,
+      mcp: 'mcp' in this.originalTool ? this.originalTool.mcp : undefined,
     } as unknown as CoreTool;
   }
 }

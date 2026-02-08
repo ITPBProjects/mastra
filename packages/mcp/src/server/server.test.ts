@@ -158,20 +158,20 @@ describe('MCPServer', () => {
   beforeEach(() => {
     vi.clearAllMocks();
 
-    // @ts-ignore - Mocking Date completely
+    // @ts-expect-error - accessing internal for testing - Mocking Date completely
     // Must use a regular function (not arrow function) to support `new Date()` constructor calls
     global.Date = vi.fn(function (this: any, ...args: any[]) {
       if (args.length === 0) {
         // new Date()
         return mockDate;
       }
-      // @ts-ignore
+      // @ts-expect-error - accessing internal for testing
       return new OriginalDate(...args); // new Date('some-string') or new Date(timestamp)
     }) as any;
 
-    // @ts-ignore
+    // @ts-expect-error - accessing internal for testing
     global.Date.now = vi.fn(() => mockDate.getTime());
-    // @ts-ignore
+    // @ts-expect-error - accessing internal for testing
     global.Date.prototype = OriginalDate.prototype;
   });
 
@@ -187,6 +187,7 @@ describe('MCPServer', () => {
       expect(server.name).toBe('TestServer');
       expect(server.version).toBe('1.0.0');
       expect(server.description).toBeUndefined();
+      expect(server.instructions).toBeUndefined();
       expect(server.repository).toBeUndefined();
       // MCPServerBase stores releaseDate as string, compare directly or re-parse
       expect(server.releaseDate).toBe(mockDateISO);
@@ -222,6 +223,33 @@ describe('MCPServer', () => {
       expect(server.packageCanonical).toBe('npm');
       expect(server.packages).toEqual(packages);
       expect(server.remotes).toEqual(remotes);
+    });
+
+    it('should initialize with instructions when provided', () => {
+      const instructions = 'You are a helpful assistant. Use the available tools to help users.';
+      const customConfig: MCPServerConfig = {
+        ...minimalConfig,
+        instructions,
+      };
+      const server = new MCPServer(customConfig);
+
+      expect(server.instructions).toBe(instructions);
+    });
+
+    it('should pass instructions to underlying SDK Server', () => {
+      const instructions = 'You are a weather assistant with access to real-time weather data.';
+      const customConfig: MCPServerConfig = {
+        ...minimalConfig,
+        instructions,
+      };
+      const server = new MCPServer(customConfig);
+
+      // Access the underlying SDK Server
+      const sdkServer = server.getServer();
+
+      // Check that the SDK Server was initialized with instructions
+      // @ts-expect-error - accessing internal for testing - accessing private property for testing
+      expect(sdkServer._instructions).toBe(instructions);
     });
   });
 
@@ -1118,7 +1146,7 @@ describe('MCPServer', () => {
 
       const serverInstance = server.getServer();
 
-      // @ts-ignore - this is a private property, but we need to access it to test the request handler
+      // @ts-expect-error - accessing internal for testing - this is a private property, but we need to access it to test the request handler
       const requestHandlers = serverInstance._requestHandlers;
       const callToolHandler = requestHandlers.get('tools/call');
 
@@ -1630,7 +1658,7 @@ describe('MCPServer - Agent to Tool Conversion', () => {
     });
 
     const serverInstance = server.getServer();
-    // @ts-ignore
+    // @ts-expect-error - accessing internal for testing
     const requestHandlers = serverInstance._requestHandlers;
     const callToolHandler = requestHandlers.get('tools/call');
 
@@ -1761,7 +1789,7 @@ describe('MCPServer - Agent to Tool Conversion', () => {
     });
 
     const serverInstance2 = server.getServer();
-    // @ts-ignore
+    // @ts-expect-error - accessing internal for testing
     const requestHandlers2 = serverInstance2._requestHandlers;
     const callToolHandler2 = requestHandlers2.get('tools/call');
 
@@ -1978,7 +2006,7 @@ describe('MCPServer - Workflow to Tool Conversion', () => {
     });
 
     const serverInstance = server.getServer();
-    // @ts-ignore - accessing private property for testing
+    // @ts-expect-error - accessing internal for testing - accessing private property for testing
     const requestHandlers = serverInstance._requestHandlers;
     const callToolHandler = requestHandlers.get('tools/call');
 

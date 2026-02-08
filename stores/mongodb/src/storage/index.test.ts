@@ -22,13 +22,46 @@ vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 
 const TEST_CONFIG: MongoDBConfig = {
   id: 'mongodb-test-store',
-  url: process.env.MONGODB_URL || 'mongodb://localhost:27017',
+  uri: process.env.MONGODB_URL || 'mongodb://localhost:27017',
   dbName: process.env.MONGODB_DB_NAME || 'mastra-test-db',
 };
 
+// Tests for GitHub issue #11697 - MongoDBStore constructor uri/url handling
+// https://github.com/mastra-ai/mastra/issues/11697
+describe('MongoDBStore constructor (#11697)', () => {
+  it('should accept "uri" parameter (recommended)', () => {
+    expect(() => {
+      new MongoDBStore({
+        id: 'test',
+        uri: 'mongodb://localhost:27017',
+        dbName: 'test_db',
+      });
+    }).not.toThrow();
+  });
+
+  it('should accept "url" parameter for backward compatibility', () => {
+    expect(() => {
+      new MongoDBStore({
+        id: 'test',
+        url: 'mongodb://localhost:27017',
+        dbName: 'test_db',
+      });
+    }).not.toThrow();
+  });
+
+  it('should throw clear error when neither uri nor url is provided', () => {
+    expect(() => {
+      new MongoDBStore({
+        id: 'test',
+        dbName: 'test_db',
+      } as any);
+    }).toThrow(/uri.*url|connection/i);
+  });
+});
+
 // Helper to create a connectorHandler from MongoClient
 const createConnectorHandler = async (): Promise<{ handler: ConnectorHandler; client: MongoClient }> => {
-  const client = new MongoClient(TEST_CONFIG.url!);
+  const client = new MongoClient(TEST_CONFIG.uri!);
   await client.connect();
   const db = client.db(TEST_CONFIG.dbName);
 
@@ -96,7 +129,7 @@ createConfigValidationTests({
     {
       description: 'empty url without connectorHandler',
       config: { id: 'test-store', url: '', dbName: 'test-db' },
-      expectedError: /url must be provided and cannot be empty/,
+      expectedError: /connection string|uri.*url/i,
     },
     {
       description: 'empty dbName without connectorHandler',
@@ -120,7 +153,7 @@ createClientAcceptanceTests({
   createStoreWithClient: () => {
     return new MongoDBStore({
       id: 'mongodb-client-test',
-      url: TEST_CONFIG.url!,
+      uri: TEST_CONFIG.uri!,
       dbName: TEST_CONFIG.dbName!,
     });
   },
@@ -133,17 +166,17 @@ createDomainDirectTests({
   storeName: 'MongoDB',
   createMemoryDomain: () =>
     new MemoryStorageMongoDB({
-      url: TEST_CONFIG.url!,
+      uri: TEST_CONFIG.uri!,
       dbName: TEST_CONFIG.dbName!,
     }),
   createWorkflowsDomain: () =>
     new WorkflowsStorageMongoDB({
-      url: TEST_CONFIG.url!,
+      uri: TEST_CONFIG.uri!,
       dbName: TEST_CONFIG.dbName!,
     }),
   createScoresDomain: () =>
     new ScoresStorageMongoDB({
-      url: TEST_CONFIG.url!,
+      uri: TEST_CONFIG.uri!,
       dbName: TEST_CONFIG.dbName!,
     }),
 });
@@ -170,15 +203,17 @@ describe('MongoDBStore connectorHandler Operations', () => {
       updatedAt: new Date(),
     };
 
-    const savedThread = await store.saveThread({ thread });
-    expect(savedThread.id).toBe(thread.id);
+    const memoryStore = await store.getStore('memory');
+    expect(memoryStore).toBeDefined();
+    const savedThread = await memoryStore?.saveThread({ thread });
+    expect(savedThread?.id).toBe(thread.id);
 
-    const retrievedThread = await store.getThreadById({ threadId: thread.id });
+    const retrievedThread = await memoryStore?.getThreadById({ threadId: thread.id });
     expect(retrievedThread).toBeDefined();
     expect(retrievedThread?.title).toBe('Test Thread');
 
     // Clean up
-    await store.deleteThread({ threadId: thread.id });
+    await memoryStore?.deleteThread({ threadId: thread.id });
     await store.close();
     await client.close();
   });
@@ -254,7 +289,9 @@ describe('MongoDB Specific Tests', () => {
 
   describe('MongoDB Document Flexibility', () => {
     beforeEach(async () => {
-      await store.stores.memory.dangerouslyClearAll();
+      const memoryStore = await store.getStore('memory');
+      expect(memoryStore).toBeDefined();
+      await memoryStore?.dangerouslyClearAll();
     });
 
     it('should handle flexible document schemas with complex nested metadata', async () => {
@@ -279,11 +316,13 @@ describe('MongoDB Specific Tests', () => {
       };
 
       // MongoDB should handle this flexible schema without issues
-      const saved = await store.saveThread({ thread });
+      const memoryStore = await store.getStore('memory');
+      expect(memoryStore).toBeDefined();
+      const saved = await memoryStore?.saveThread({ thread });
       expect(saved).toBeTruthy();
-      expect(saved.id).toBe(thread.id);
+      expect(saved?.id).toBe(thread.id);
 
-      const retrieved = await store.getThreadById({ threadId: thread.id });
+      const retrieved = await memoryStore?.getThreadById({ threadId: thread.id });
       expect(retrieved).toBeTruthy();
       expect(retrieved?.metadata).toMatchObject({
         customField: 'custom value',
@@ -311,9 +350,11 @@ describe('MongoDB Specific Tests', () => {
         updatedAt: new Date(),
       };
 
-      await store.saveThread({ thread });
+      const memoryStore = await store.getStore('memory');
+      expect(memoryStore).toBeDefined();
+      await memoryStore?.saveThread({ thread });
 
-      const retrieved = await store.getThreadById({ threadId: thread.id });
+      const retrieved = await memoryStore?.getThreadById({ threadId: thread.id });
       expect(retrieved).toBeTruthy();
       expect((retrieved?.metadata as any)?.geoLocation?.coordinates).toEqual([-122.4194, 37.7749]);
       expect((retrieved?.metadata as any)?.tags).toEqual(['ai', 'mongodb', 'flexible']);
@@ -322,14 +363,18 @@ describe('MongoDB Specific Tests', () => {
 
   describe('MongoDB JSON/JSONB Field Handling', () => {
     beforeEach(async () => {
-      await store.stores.memory.dangerouslyClearAll();
+      const memoryStore = await store.getStore('memory');
+      expect(memoryStore).toBeDefined();
+      await memoryStore?.dangerouslyClearAll();
     });
 
     it('should handle complex JSON structures in message content', async () => {
       // First create a thread
       const threadId = `thread-json-test-${Date.now()}`;
       const resourceId = 'resource-json-test';
-      await store.saveThread({
+      const memoryStore = await store.getStore('memory');
+      expect(memoryStore).toBeDefined();
+      await memoryStore?.saveThread({
         thread: {
           id: threadId,
           resourceId,
@@ -381,10 +426,12 @@ describe('MongoDB Specific Tests', () => {
       };
 
       // MongoDB should handle this complex nested structure naturally
-      const result = await store.saveMessages({ messages: [complexMessage] });
-      expect(result.messages).toHaveLength(1);
+      expect(memoryStore).toBeDefined();
+      const result = await memoryStore?.saveMessages({ messages: [complexMessage] });
+      expect(result?.messages).toHaveLength(1);
 
-      const { messages } = await store.listMessagesById({ messageIds: [messageId] });
+      const messagesResult = await memoryStore?.listMessagesById({ messageIds: [messageId] });
+      const messages = messagesResult?.messages ?? [];
       expect(messages).toHaveLength(1);
       expect(messages[0]?.content).toBeDefined();
     });
@@ -425,7 +472,9 @@ describe('MongoDB Specific Tests', () => {
 
   describe('MongoDB Span Operations with Complex Data', () => {
     beforeEach(async () => {
-      await store.stores.observability!.dangerouslyClearAll();
+      const observabilityStore = await store.getStore('observability');
+      expect(observabilityStore).toBeDefined();
+      await observabilityStore?.dangerouslyClearAll();
     });
 
     it('should handle Span creation with MongoDB-specific nested attributes', async () => {
@@ -481,10 +530,13 @@ describe('MongoDB Specific Tests', () => {
         error: null,
       };
 
-      await expect(store.createSpan(span)).resolves.not.toThrow();
+      const observabilityStore = await store.getStore('observability');
+      expect(observabilityStore).toBeDefined();
+
+      await expect(observabilityStore?.createSpan({ span: span as any })).resolves.not.toThrow();
 
       // Verify the span was created
-      const trace = await store.getTrace(traceId);
+      const trace = await observabilityStore?.getTrace({ traceId });
       expect(trace).toBeTruthy();
       expect(trace?.spans).toHaveLength(1);
       expect(trace?.spans[0]?.spanId).toBe(spanId);
@@ -516,7 +568,9 @@ describe('MongoDB Specific Tests', () => {
         links: null,
       };
 
-      await store.createSpan(initialSpan);
+      const observabilityStore = await store.getStore('observability');
+      expect(observabilityStore).toBeDefined();
+      await observabilityStore?.createSpan({ span: initialSpan as any });
 
       // Update with complex nested data
       const updates = {
@@ -549,7 +603,7 @@ describe('MongoDB Specific Tests', () => {
       };
 
       await expect(
-        store.updateSpan({
+        observabilityStore?.updateSpan({
           spanId,
           traceId,
           updates,
@@ -557,7 +611,7 @@ describe('MongoDB Specific Tests', () => {
       ).resolves.not.toThrow();
 
       // Verify updates were applied
-      const trace = await store.getTrace(traceId);
+      const trace = await observabilityStore?.getTrace({ traceId });
       expect(trace?.spans[0]?.output).toBeDefined();
       expect(trace?.spans[0]?.endedAt).toBeDefined();
     });
@@ -566,7 +620,7 @@ describe('MongoDB Specific Tests', () => {
 
 // Helper to check if a MongoDB index exists in a collection
 const mongoIndexExists = async (dbName: string, namePattern: string): Promise<boolean> => {
-  const client = new MongoClient(TEST_CONFIG.url!);
+  const client = new MongoClient(TEST_CONFIG.uri!);
   try {
     await client.connect();
     const db = client.db(dbName);
@@ -592,7 +646,7 @@ createStoreIndexTests({
     currentStoreTestDbName = `idx_s_${storeTestId}_d`;
     return new MongoDBStore({
       id: 'mongodb-idx-default',
-      url: TEST_CONFIG.url!,
+      uri: TEST_CONFIG.uri!,
       dbName: currentStoreTestDbName,
     });
   },
@@ -600,7 +654,7 @@ createStoreIndexTests({
     currentStoreTestDbName = `idx_s_${storeTestId}_s`;
     return new MongoDBStore({
       id: 'mongodb-idx-skip',
-      url: TEST_CONFIG.url!,
+      uri: TEST_CONFIG.uri!,
       dbName: currentStoreTestDbName,
       skipDefaultIndexes: true,
     });
@@ -609,7 +663,7 @@ createStoreIndexTests({
     currentStoreTestDbName = `idx_s_${storeTestId}_c`;
     return new MongoDBStore({
       id: 'mongodb-idx-custom',
-      url: TEST_CONFIG.url!,
+      uri: TEST_CONFIG.uri!,
       dbName: currentStoreTestDbName,
       indexes: indexes.map(idx => ({
         collection: (idx as any).collection || TABLE_THREADS,
@@ -622,7 +676,7 @@ createStoreIndexTests({
     currentStoreTestDbName = `idx_s_${storeTestId}_i`;
     return new MongoDBStore({
       id: 'mongodb-idx-invalid',
-      url: TEST_CONFIG.url!,
+      uri: TEST_CONFIG.uri!,
       dbName: currentStoreTestDbName,
       indexes: indexes.map(idx => ({
         collection: (idx as any).collection || 'nonexistent_collection_xyz',
@@ -656,14 +710,14 @@ createDomainIndexTests({
   createDefaultDomain: () => {
     currentDomainTestDbName = `idx_d_${domainTestId}_d`;
     return new MemoryStorageMongoDB({
-      url: TEST_CONFIG.url!,
+      uri: TEST_CONFIG.uri!,
       dbName: currentDomainTestDbName,
     });
   },
   createDomainWithSkipDefaults: () => {
     currentDomainTestDbName = `idx_d_${domainTestId}_s`;
     return new MemoryStorageMongoDB({
-      url: TEST_CONFIG.url!,
+      uri: TEST_CONFIG.uri!,
       dbName: currentDomainTestDbName,
       skipDefaultIndexes: true,
     });
@@ -671,7 +725,7 @@ createDomainIndexTests({
   createDomainWithCustomIndexes: indexes => {
     currentDomainTestDbName = `idx_d_${domainTestId}_c`;
     return new MemoryStorageMongoDB({
-      url: TEST_CONFIG.url!,
+      uri: TEST_CONFIG.uri!,
       dbName: currentDomainTestDbName,
       indexes: indexes.map(idx => ({
         collection: (idx as any).collection || TABLE_THREADS,
@@ -683,7 +737,7 @@ createDomainIndexTests({
   createDomainWithInvalidTable: indexes => {
     currentDomainTestDbName = `idx_d_${domainTestId}_i`;
     return new MemoryStorageMongoDB({
-      url: TEST_CONFIG.url!,
+      uri: TEST_CONFIG.uri!,
       dbName: currentDomainTestDbName,
       indexes: indexes.map(idx => ({
         collection: (idx as any).collection || 'nonexistent_collection_xyz',

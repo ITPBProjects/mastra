@@ -1,20 +1,24 @@
 ---
 title: "Reference: libSQL Storage | Storage"
 description: Documentation for the libSQL storage implementation in Mastra.
+packages:
+  - "@mastra/core"
+  - "@mastra/libsql"
+  - "@mastra/memory"
 ---
 
 # libSQL Storage
 
 [libSQL](https://docs.turso.tech/libsql) is an open-source, SQLite-compatible database that supports both local and remote deployments. It can be used to store message history, workflow snapshots, traces, and eval scores.
 
-For vectors like semantic recall or traditional RAG, use [libSQL Vector](/reference/v1/vectors/libsql) which covers embeddings and vector search.
+For vectors like semantic recall or traditional RAG, use [libSQL Vector](/reference/vectors/libsql) which covers embeddings and vector search.
 
 ## Installation
 
 Storage providers must be installed as separate packages:
 
-```bash
-npm install @mastra/libsql@beta
+```bash npm2yarn
+npm install @mastra/libsql@latest
 ```
 
 ## Usage
@@ -97,7 +101,7 @@ In-memory storage resets when the process changes. Only suitable for development
 
 ## Initialization
 
-When you pass storage to the Mastra class, `init()` is called automatically to create the [core schema](/reference/v1/storage/overview#core-schema):
+When you pass storage to the Mastra class, `init()` is called automatically to create the [core schema](/reference/storage/overview#core-schema):
 
 ```typescript 
 import { Mastra } from "@mastra/core";
@@ -115,7 +119,7 @@ const mastra = new Mastra({
 
 If using storage directly without Mastra, call `init()` explicitly:
 
-```typescript 
+```typescript
 import { LibSQLStore } from "@mastra/libsql";
 
 const storage = new LibSQLStore({
@@ -124,5 +128,14 @@ const storage = new LibSQLStore({
 });
 
 await storage.init();
-await storage.getThread({ threadId: "..." });
+
+// Access domain-specific stores via getStore()
+const memoryStore = await storage.getStore('memory');
+const thread = await memoryStore?.getThreadById({ threadId: "..." });
 ```
+
+## Observability
+
+libSQL supports observability and is ideal for local development. Use the `realtime` [tracing strategy](/docs/observability/tracing/exporters/default#tracing-strategies) for immediate visibility while debugging.
+
+For production environments with higher trace volumes, consider using [PostgreSQL](/reference/storage/postgresql) or [ClickHouse via composite storage](/reference/storage/composite#specialized-storage-for-observability).
